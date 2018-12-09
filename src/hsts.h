@@ -1,7 +1,5 @@
 /* Declarations for hsts.c
-   Copyright (C) 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004,
-   2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2015 Free Software
-   Foundation, Inc.
+   Copyright (C) 1996-2012, 2015, 2018 Free Software Foundation, Inc.
 
 This file is part of GNU Wget.
 
@@ -28,13 +26,13 @@ grants you additional permission to convey the resulting work.
 Corresponding Source for a non-source form of such a combination
 shall include the source code for the parts of OpenSSL used as well
 as that of the covered work.  */
-#include "wget.h"
+
+#ifndef WGET_HSTS_H
+#define WGET_HSTS_H
 
 #ifdef HAVE_HSTS
 
-#ifndef HSTS_H
-#define HSTS_H
-
+#include "wget.h"
 #include "url.h"
 
 typedef struct hsts_store *hsts_store_t;
@@ -43,11 +41,12 @@ hsts_store_t hsts_store_open (const char *);
 
 void hsts_store_save (hsts_store_t, const char *);
 void hsts_store_close (hsts_store_t);
+bool hsts_store_has_changed (hsts_store_t);
 
 bool hsts_store_entry (hsts_store_t,
                        enum url_scheme, const char *, int,
                        time_t, bool);
 bool hsts_match (hsts_store_t, struct url *);
 
-#endif /* HSTS_H */
 #endif /* HAVE_HSTS */
+#endif /* WGET_HSTS_H */

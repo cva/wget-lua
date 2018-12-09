@@ -1,6 +1,6 @@
 /* Conversion of links to local files.
-   Copyright (C) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011,
-   2014, 2015 Free Software Foundation, Inc.
+   Copyright (C) 2003-2011, 2014-2015, 2018 Free Software Foundation,
+   Inc.
 
 This file is part of GNU Wget.
 
@@ -303,12 +303,12 @@ convert_links (const char *file, struct urlpos *links)
         {
         case CO_CONVERT_TO_RELATIVE:
           /* Convert absolute URL to relative. */
-          {
+          if (link->local_name) {
             char *newname = construct_relative (file, link->local_name);
             char *quoted_newname = local_quote_string (newname,
                                                        link->link_css_p);
 
-            if (link->link_css_p)
+            if (link->link_css_p || link->link_noquote_html_p)
               p = replace_plain (p, link->size, fp, quoted_newname);
             else if (!link->link_refresh_p)
               p = replace_attr (p, link->size, fp, quoted_newname);
@@ -322,14 +322,14 @@ convert_links (const char *file, struct urlpos *links)
             xfree (newname);
             xfree (quoted_newname);
             ++to_file_count;
-            break;
           }
+          break;
         case CO_CONVERT_BASENAME_ONLY:
           {
             char *newname = convert_basename (p, link);
             char *quoted_newname = local_quote_string (newname, link->link_css_p);
 
-            if (link->link_css_p)
+            if (link->link_css_p || link->link_noquote_html_p)
               p = replace_plain (p, link->size, fp, quoted_newname);
             else if (!link->link_refresh_p)
               p = replace_attr (p, link->size, fp, quoted_newname);
@@ -352,7 +352,7 @@ convert_links (const char *file, struct urlpos *links)
             char *newlink = link->url->url;
             char *quoted_newlink = html_quote_string (newlink);
 
-            if (link->link_css_p)
+            if (link->link_css_p || link->link_noquote_html_p)
               p = replace_plain (p, link->size, fp, newlink);
             else if (!link->link_refresh_p)
               p = replace_attr (p, link->size, fp, quoted_newlink);
@@ -1024,7 +1024,7 @@ convert_cleanup (void)
 
 /* This table should really be merged with dl_file_url_map and
    downloaded_html_files.  This was originally a list, but I changed
-   it to a hash table beause it was actually taking a lot of time to
+   it to a hash table because it was actually taking a lot of time to
    find things in it.  */
 
 static struct hash_table *downloaded_files_hash;

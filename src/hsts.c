@@ -1,7 +1,5 @@
 /* HTTP Strict Transport Security (HSTS) support.
-   Copyright (C) 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004,
-   2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2015 Free Software
-   Foundation, Inc.
+   Copyright (C) 1996-2012, 2015, 2018 Free Software Foundation, Inc.
 
 This file is part of GNU Wget.
 
@@ -32,13 +30,13 @@ as that of the covered work.  */
 
 #ifdef HAVE_HSTS
 #include "hsts.h"
+#include "utils.h"
 #include "host.h" /* for is_valid_ip_address() */
 #include "init.h" /* for home_dir() */
-#include "utils.h"
 #include "hash.h"
 #include "c-ctype.h"
 #ifdef TESTING
-#include "test.h"
+#include "../tests/unit-tests.h"
 #endif
 
 #include <unistd.h>
@@ -53,6 +51,7 @@ as that of the covered work.  */
 struct hsts_store {
   struct hash_table *table;
   time_t last_mtime;
+  bool changed;
 };
 
 struct hsts_kh {
@@ -79,12 +78,14 @@ enum hsts_kh_match {
 
 #define DEFAULT_HTTP_PORT 80
 #define DEFAULT_SSL_PORT  443
-#define CHECK_EXPLICIT_PORT(p1, p2) (p1 == 0 || p1 == p2)
 #define MAKE_EXPLICIT_PORT(s, p) (s == SCHEME_HTTPS ? (p == DEFAULT_SSL_PORT ? 0 : p) \
     : (p == DEFAULT_HTTP_PORT ? 0 : p))
 
 /* Hashing and comparison functions for the hash table */
 
+#ifdef __clang__
+__attribute__((no_sanitize("integer")))
+#endif
 static unsigned long
 hsts_hash_func (const void *key)
 {
@@ -316,7 +317,7 @@ hsts_store_dump (hsts_store_t store, FILE *fp)
   /* Print preliminary comments. We don't care if any of these fail. */
   fputs ("# HSTS 1.0 Known Hosts database for GNU Wget.\n", fp);
   fputs ("# Edit at your own risk.\n", fp);
-  fputs ("# <hostname>[:<port>]\t<incl. subdomains>\t<created>\t<max-age>\n", fp);
+  fputs ("# <hostname>\t<port>\t<incl. subdomains>\t<created>\t<max-age>\n", fp);
 
   /* Now cycle through the HSTS store in memory and dump the entries */
   for (hash_table_iterate (store->table, &it); hash_table_iter_next (&it);)
@@ -326,12 +327,37 @@ hsts_store_dump (hsts_store_t store, FILE *fp)
 
       if (fprintf (fp, "%s\t%d\t%d\t%lu\t%lu\n",
                    kh->host, kh->explicit_port, khi->include_subdomains,
-                   khi->created, khi->max_age) < 0)
+                   (unsigned long) khi->created,
+                   (unsigned long) khi->max_age) < 0)
         {
           logprintf (LOG_ALWAYS, "Could not write the HSTS database correctly.\n");
           break;
         }
     }
+}
+
+/*
+ * Test:
+ *  - The file is a regular file (ie. not a symlink), and
+ *  - The file is not world-writable.
+ */
+static bool
+hsts_file_access_valid (const char *filename)
+{
+  struct stat st;
+
+  if (stat (filename, &st) == -1)
+    return false;
+
+  return
+#ifndef WINDOWS
+      /*
+       * The world-writable concept is a Unix-centric notion.
+       * We bypass this test on Windows.
+       */
+      !(st.st_mode & S_IWOTH) &&
+#endif
+      S_ISREG (st.st_mode);
 }
 
 /* HSTS API */
@@ -370,10 +396,14 @@ hsts_match (hsts_store_t store, struct url *u)
                   if (u->port == 80)
                     u->port = 443;
                   url_changed = true;
+                  store->changed = true;
                 }
             }
           else
-            hsts_remove_entry (store, kh);
+            {
+              hsts_remove_entry (store, kh);
+              store->changed = true;
+            }
         }
       xfree (kh->host);
     }
@@ -414,7 +444,6 @@ hsts_store_entry (hsts_store_t store,
   enum hsts_kh_match match = NO_MATCH;
   struct hsts_kh *kh = xnew(struct hsts_kh);
   struct hsts_kh_info *entry = NULL;
-  time_t t = 0;
 
   if (hsts_is_host_eligible (scheme, host))
     {
@@ -423,19 +452,25 @@ hsts_store_entry (hsts_store_t store,
       if (entry && match == CONGRUENT_MATCH)
         {
           if (max_age == 0)
-            hsts_remove_entry (store, kh);
+            {
+              hsts_remove_entry (store, kh);
+              store->changed = true;
+            }
           else if (max_age > 0)
             {
-              entry->include_subdomains = include_subdomains;
+              /* RFC 6797 states that 'max_age' is a TTL relative to the
+               * reception of the STS header so we have to update the
+               * 'created' field too. The RFC also states that we have to
+               * update the entry each time we see HSTS header.
+               * See also Section 11.2. */
+              time_t t = time (NULL);
 
-              if (entry->max_age != max_age)
+              if (t != -1 && t != entry->created)
                 {
-                  /* RFC 6797 states that 'max_age' is a TTL relative to the reception of the STS header
-                     so we have to update the 'created' field too */
-                  t = time (NULL);
-                  if (t != -1)
-                    entry->created = t;
+                  entry->created = t;
                   entry->max_age = max_age;
+                  entry->include_subdomains = include_subdomains;
+                  store->changed = true;
                 }
             }
           /* we ignore negative max_ages */
@@ -450,6 +485,8 @@ hsts_store_entry (hsts_store_t store,
              happen we got a non-existent entry with max_age == 0.
           */
           result = hsts_add_entry (store, host, port, max_age, include_subdomains);
+          if (result)
+            store->changed = true;
         }
       /* we ignore new entries with max_age == 0 */
       xfree (kh->host);
@@ -464,28 +501,47 @@ hsts_store_t
 hsts_store_open (const char *filename)
 {
   hsts_store_t store = NULL;
-  struct_stat st;
-  FILE *fp = NULL;
+  file_stats_t fstats;
 
   store = xnew0 (struct hsts_store);
   store->table = hash_table_new (0, hsts_hash_func, hsts_cmp_func);
   store->last_mtime = 0;
+  store->changed = false;
 
-  if (file_exists_p (filename))
+  if (file_exists_p (filename, &fstats))
     {
-      fp = fopen (filename, "r");
-
-      if (!fp || !hsts_read_database (store, fp, false))
+      if (hsts_file_access_valid (filename))
         {
-          /* abort! */
+          struct stat st;
+          FILE *fp = fopen_stat (filename, "r", &fstats);
+
+          if (!fp || !hsts_read_database (store, fp, false))
+            {
+              /* abort! */
+              hsts_store_close (store);
+              xfree (store);
+              if (fp)
+                fclose (fp);
+              goto out;
+            }
+
+          if (fstat (fileno (fp), &st) == 0)
+            store->last_mtime = st.st_mtime;
+
+          fclose (fp);
+        }
+      else
+        {
+          /*
+           * If we're not reading the HSTS database,
+           * then by all means act as if HSTS was disabled.
+           */
           hsts_store_close (store);
           xfree (store);
-          goto out;
-        }
 
-      if (fstat (fileno (fp), &st) == 0)
-        store->last_mtime = st.st_mtime;
-      fclose (fp);
+          logprintf (LOG_NOTQUIET, "Will not apply HSTS. "
+                     "The HSTS database must be a regular and non-world-writable file.\n");
+        }
     }
 
 out:
@@ -495,7 +551,7 @@ out:
 void
 hsts_store_save (hsts_store_t store, const char *filename)
 {
-  struct_stat st;
+  struct stat st;
   FILE *fp = NULL;
   int fd = 0;
 
@@ -527,6 +583,12 @@ hsts_store_save (hsts_store_t store, const char *filename)
           fclose (fp);
         }
     }
+}
+
+bool
+hsts_store_has_changed (hsts_store_t store)
+{
+  return (store ? store->changed : false);
 }
 
 void
@@ -562,19 +624,17 @@ hsts_store_close (hsts_store_t store)
 static char *
 get_hsts_store_filename (void)
 {
-  char *home = NULL, *filename = NULL;
+  char *filename = NULL;
   FILE *fp = NULL;
 
-  home = home_dir ();
-  if (home)
+  if (opt.homedir)
     {
-      filename = aprintf ("%s/.wget-hsts-test", home);
+      filename = aprintf ("%s/.wget-hsts-test", opt.homedir);
       fp = fopen (filename, "w");
       if (fp)
         fclose (fp);
     }
 
-  xfree (home);
   return filename;
 }
 
@@ -594,11 +654,13 @@ open_hsts_test_store (void)
 static void
 close_hsts_test_store (hsts_store_t store)
 {
-  char *filename = NULL;
+  char *filename;
 
-  filename = get_hsts_store_filename ();
-  unlink (filename);
-  xfree (filename);
+  if ((filename = get_hsts_store_filename ()))
+    {
+      unlink (filename);
+      xfree (filename);
+    }
   xfree (store);
 }
 
@@ -727,21 +789,20 @@ const char*
 test_hsts_read_database (void)
 {
   hsts_store_t table;
-  char *home = home_dir();
   char *file = NULL;
   FILE *fp = NULL;
   time_t created = time(NULL) - 10;
 
-  if (home)
+  if (opt.homedir)
     {
-      file = aprintf ("%s/.wget-hsts-testing", home);
+      file = aprintf ("%s/.wget-hsts-testing", opt.homedir);
       fp = fopen (file, "w");
       if (fp)
         {
           fputs ("# dummy comment\n", fp);
-          fprintf (fp, "foo.example.com\t0\t1\t%ld\t123\n",(long) created);
-          fprintf (fp, "bar.example.com\t0\t0\t%ld\t456\n", (long) created);
-          fprintf (fp, "test.example.com\t8080\t0\t%ld\t789\n", (long) created);
+          fprintf (fp, "foo.example.com\t0\t1\t%lu\t123\n",(unsigned long) created);
+          fprintf (fp, "bar.example.com\t0\t0\t%lu\t456\n", (unsigned long) created);
+          fprintf (fp, "test.example.com\t8080\t0\t%lu\t789\n", (unsigned long) created);
           fclose (fp);
 
           table = hsts_store_open (file);
@@ -759,7 +820,6 @@ test_hsts_read_database (void)
           unlink (file);
         }
       xfree (file);
-      xfree (home);
     }
 
   return NULL;

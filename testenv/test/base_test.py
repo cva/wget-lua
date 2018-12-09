@@ -4,6 +4,7 @@ import shlex
 import traceback
 import re
 import time
+import sys
 from subprocess import call
 from misc.colour_terminal import print_red, print_blue
 from exc.test_failed import TestFailed
@@ -22,12 +23,12 @@ class BaseTest:
         * instantiate_server_by(protocol)
     """
 
-    def __init__(self, name, pre_hook, test_params, post_hook, protocols, req_protocols):
+    def __init__(self, pre_hook, test_params, post_hook, protocols, req_protocols):
         """
         Define the class-wide variables (or attributes).
         Attributes should not be defined outside __init__.
         """
-        self.name = name
+        self.name = os.path.basename(os.path.realpath(sys.argv[0]))
         # if pre_hook == None, then {} (an empty dict object) is passed to
         # self.pre_configs
         self.pre_configs = pre_hook or {}
@@ -89,7 +90,7 @@ class BaseTest:
             # ports and etc.
             # so we should record different domains respect to servers.
             domain = self.get_domain_addr(instance.server_address)
-            self.domains.append(domain[0])
+            self.domains.append('localhost')
             self.ports.append(domain[1])
 
     def exec_wget(self):
@@ -101,7 +102,7 @@ class BaseTest:
             time.sleep(float(os.getenv("SERVER_WAIT")))
 
         try:
-            ret_code = call(params)
+            ret_code = call(params, env={"HOME": os.getcwd()})
         except FileNotFoundError:
             raise TestFailed("The Wget Executable does not exist at the "
                              "expected path.")
@@ -162,6 +163,7 @@ class BaseTest:
                 shutil.rmtree(self.get_test_dir())
         except:
             print("Unknown Exception while trying to remove Test Environment.")
+            self.tests_passed = False
 
     def _exit_test(self):
         self.__test_cleanup()
@@ -263,4 +265,4 @@ class BaseTest:
                 traceback.print_tb(exc_tb)
         self.__test_cleanup()
 
-        return True
+        return self.tests_passed

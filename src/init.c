@@ -1,7 +1,6 @@
 /* Reading/parsing the initialization file.
-   Copyright (C) 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004,
-   2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2014, 2015 Free
-   Software Foundation, Inc.
+   Copyright (C) 1996-2012, 2014-2015, 2018 Free Software Foundation,
+   Inc.
 
 This file is part of GNU Wget.
 
@@ -48,9 +47,6 @@ as that of the covered work.  */
 #endif
 
 #include <regex.h>
-#ifdef HAVE_LIBPCRE
-# include <pcre.h>
-#endif
 
 #ifdef HAVE_PWD_H
 # include <pwd.h>
@@ -70,10 +66,11 @@ as that of the covered work.  */
 #include "warc.h"               /* for warc_close */
 #include "spider.h"             /* for spider_cleanup */
 #include "html-url.h"           /* for cleanup_html_url */
+#include "ptimer.h"             /* for ptimer_destroy */
 #include "c-strcase.h"
 
 #ifdef TESTING
-#include "test.h"
+#include "../tests/unit-tests.h"
 #endif
 
 
@@ -97,6 +94,11 @@ CMD_DECLARE (cmd_directory);
 CMD_DECLARE (cmd_time);
 CMD_DECLARE (cmd_vector);
 
+CMD_DECLARE (cmd_use_askpass);
+
+#ifdef HAVE_LIBZ
+CMD_DECLARE (cmd_spec_compression);
+#endif
 CMD_DECLARE (cmd_spec_dirstruct);
 CMD_DECLARE (cmd_spec_header);
 CMD_DECLARE (cmd_spec_warc_header);
@@ -143,6 +145,9 @@ static const struct {
   { "backups",          &opt.backups,           cmd_number },
   { "base",             &opt.base_href,         cmd_string },
   { "bindaddress",      &opt.bind_address,      cmd_string },
+#ifdef HAVE_LIBCARES
+  { "binddnsaddress",   &opt.bind_dns_address,  cmd_string },
+#endif
   { "bodydata",         &opt.body_data,         cmd_string },
   { "bodyfile",         &opt.body_file,         cmd_string },
 #ifdef HAVE_SSL
@@ -156,6 +161,12 @@ static const struct {
   { "checkcertificate", &opt.check_cert,        cmd_check_cert },
 #endif
   { "chooseconfig",     &opt.choose_config,     cmd_file },
+#ifdef HAVE_SSL
+  { "ciphers",          &opt.tls_ciphers_string, cmd_string },
+#endif
+#ifdef HAVE_LIBZ
+  { "compression",      &opt.compression,       cmd_spec_compression },
+#endif
   { "connecttimeout",   &opt.connect_timeout,   cmd_time },
   { "contentdisposition", &opt.content_disposition, cmd_boolean },
   { "contentonerror",   &opt.content_on_error,  cmd_boolean },
@@ -173,6 +184,9 @@ static const struct {
   { "dirprefix",        &opt.dir_prefix,        cmd_directory },
   { "dirstruct",        NULL,                   cmd_spec_dirstruct },
   { "dnscache",         &opt.dns_cache,         cmd_boolean },
+#ifdef HAVE_LIBCARES
+  { "dnsservers",       &opt.dns_servers,       cmd_string },
+#endif
   { "dnstimeout",       &opt.dns_timeout,       cmd_time },
   { "domains",          &opt.domains,           cmd_vector },
   { "dotbytes",         &opt.dot_bytes,         cmd_bytes },
@@ -204,7 +218,7 @@ static const struct {
   { "header",           NULL,                   cmd_spec_header },
 #ifdef HAVE_HSTS
   { "hsts",             &opt.hsts,              cmd_boolean },
-  { "hsts-file",        &opt.hsts_file,         cmd_file },
+  { "hstsfile",         &opt.hsts_file,         cmd_file },
 #endif
   { "htmlextension",    &opt.adjust_extension,  cmd_boolean }, /* deprecated */
   { "htmlify",          NULL,                   cmd_spec_htmlify },
@@ -217,7 +231,7 @@ static const struct {
 #endif
   { "httpsproxy",       &opt.https_proxy,       cmd_string },
   { "httpuser",         &opt.http_user,         cmd_string },
-  { "if-modified-since", &opt.if_modified_since, cmd_boolean },
+  { "ifmodifiedsince",  &opt.if_modified_since, cmd_boolean },
   { "ignorecase",       &opt.ignore_case,       cmd_boolean },
   { "ignorelength",     &opt.ignore_length,     cmd_boolean },
   { "ignoretags",       &opt.ignore_tags,       cmd_vector },
@@ -228,9 +242,10 @@ static const struct {
 #endif
   { "input",            &opt.input_filename,    cmd_file },
 #ifdef HAVE_METALINK
-  { "input-metalink",   &opt.input_metalink,    cmd_file },
+  { "inputmetalink",    &opt.input_metalink,    cmd_file },
 #endif
   { "iri",              &opt.enable_iri,        cmd_boolean },
+  { "keepbadhash",      &opt.keep_badhash,      cmd_boolean },
   { "keepsessioncookies", &opt.keep_session_cookies, cmd_boolean },
   { "limitrate",        &opt.limit_rate,        cmd_bytes },
   { "loadcookies",      &opt.cookies_input,     cmd_file },
@@ -242,7 +257,8 @@ static const struct {
 #endif
   { "maxredirect",      &opt.max_redirect,      cmd_number },
 #ifdef HAVE_METALINK
-  { "metalink-over-http", &opt.metalink_over_http, cmd_boolean },
+  { "metalinkindex",    &opt.metalink_index,     cmd_number_inf },
+  { "metalinkoverhttp", &opt.metalink_over_http, cmd_boolean },
 #endif
   { "method",           &opt.method,            cmd_string_uppercase },
   { "mirror",           NULL,                   cmd_spec_mirror },
@@ -257,11 +273,14 @@ static const struct {
   { "passiveftp",       &opt.ftp_pasv,          cmd_boolean },
   { "passwd",           &opt.ftp_passwd,        cmd_string },/* deprecated*/
   { "password",         &opt.passwd,            cmd_string },
+#ifdef HAVE_SSL
+  { "pinnedpubkey",     &opt.pinnedpubkey,      cmd_string },
+#endif
   { "postdata",         &opt.post_data,         cmd_string },
   { "postfile",         &opt.post_file_name,    cmd_file },
   { "preferfamily",     NULL,                   cmd_spec_prefer_family },
 #ifdef HAVE_METALINK
-  { "preferred-location", &opt.preferred_location, cmd_string },
+  { "preferredlocation", &opt.preferred_location, cmd_string },
 #endif
   { "preservepermissions", &opt.preserve_perm,  cmd_boolean },
 #ifdef HAVE_SSL
@@ -294,6 +313,8 @@ static const struct {
   { "restrictfilenames", NULL,                  cmd_spec_restrict_file_names },
   { "retrsymlinks",     &opt.retr_symlinks,     cmd_boolean },
   { "retryconnrefused", &opt.retry_connrefused, cmd_boolean },
+  { "retryonhosterror", &opt.retry_on_host_error, cmd_boolean },
+  { "retryonhttperror", &opt.retry_on_http_error, cmd_string },
   { "robots",           &opt.use_robots,        cmd_boolean },
   { "rotatedns",        &opt.rotate_dns,        cmd_boolean },
   { "savecookies",      &opt.cookies_output,    cmd_file },
@@ -313,7 +334,8 @@ static const struct {
   { "tries",            &opt.ntry,              cmd_number_inf },
   { "truncateoutput",   &opt.truncate_output_document, cmd_boolean },
   { "trustservernames", &opt.trustservernames,  cmd_boolean },
-  { "unlink",           &opt.unlink,            cmd_boolean },
+  { "unlink",           &opt.unlink_requested,  cmd_boolean },
+  { "useaskpass" ,      &opt.use_askpass,       cmd_use_askpass },
   { "useproxy",         &opt.use_proxy,         cmd_boolean },
   { "user",             &opt.user,              cmd_string },
   { "useragent",        NULL,                   cmd_spec_useragent },
@@ -334,6 +356,9 @@ static const struct {
   { "warctempdir",      &opt.warc_tempdir,      cmd_directory },
 #ifdef USE_WATT32
   { "wdebug",           &opt.wdebug,            cmd_boolean },
+#endif
+#ifdef ENABLE_XATTR
+  { "xattr",            &opt.enable_xattr,      cmd_boolean },
 #endif
 };
 
@@ -373,6 +398,10 @@ defaults (void)
      illegal, but porting Wget to a machine where NULL is not all-zero
      bit pattern will be the least of the implementors' worries.  */
   xzero (opt);
+
+#ifdef HAVE_METALINK
+  opt.metalink_index = -1;
+#endif
 
   opt.cookies = true;
   opt.verbose = -1;
@@ -428,6 +457,10 @@ defaults (void)
   opt.ftps_clear_data_connection = false;
 #endif
 
+#ifdef HAVE_LIBZ
+  opt.compression = compression_none;
+#endif
+
   /* The default for file name restriction defaults to the OS type. */
 #if defined(WINDOWS) || defined(MSDOS) || defined(__CYGWIN__)
   opt.restrict_files_os = restrict_windows;
@@ -479,6 +512,12 @@ defaults (void)
 #ifdef HAVE_HSTS
   /* HSTS is enabled by default */
   opt.hsts = true;
+#endif
+
+#ifdef ENABLE_XATTR
+  opt.enable_xattr = true;
+#else
+  opt.enable_xattr = false;
 #endif
 }
 
@@ -545,10 +584,11 @@ wgetrc_env_file_name (void)
   char *env = getenv ("WGETRC");
   if (env && *env)
     {
-      if (!file_exists_p (env))
+      file_stats_t flstat;
+      if (!file_exists_p (env, &flstat))
         {
-          fprintf (stderr, _("%s: WGETRC points to %s, which doesn't exist.\n"),
-                   exec_name, env);
+          fprintf (stderr, _("%s: WGETRC points to %s, which couldn't be accessed because of error: %s.\n"),
+                   exec_name, env, strerror(flstat.access_err));
           exit (WGET_EXIT_GENERIC_ERROR);
         }
       return xstrdup (env);
@@ -556,31 +596,30 @@ wgetrc_env_file_name (void)
   return NULL;
 }
 
-/* Check for the existance of '$HOME/.wgetrc' and return its path
+/* Check for the existence of '$HOME/.wgetrc' and return its path
    if it exists and is set.  */
 char *
 wgetrc_user_file_name (void)
 {
-  char *home;
   char *file = NULL;
   /* If that failed, try $HOME/.wgetrc (or equivalent).  */
 
 #ifdef __VMS
   file = "SYS$LOGIN:.wgetrc";
 #else /* def __VMS */
-  home = home_dir ();
-  if (home)
-    file = aprintf ("%s/.wgetrc", home);
-  xfree (home);
+  if (opt.homedir)
+    file = aprintf ("%s/.wgetrc", opt.homedir);
 #endif /* def __VMS [else] */
 
   if (!file)
     return NULL;
-  if (!file_exists_p (file))
+#ifndef FUZZING
+  if (!file_exists_p (file, NULL))
     {
       xfree (file);
       return NULL;
     }
+#endif
   return file;
 }
 
@@ -605,15 +644,14 @@ wgetrc_file_name (void)
      SYSTEM_WGETRC should not be defined under WINDOWS.  */
   if (!file)
     {
-      char *home = ws_mypath ();
+      const char *home = ws_mypath ();
       if (home)
         {
           file = aprintf ("%s/wget.ini", home);
-          if (!file_exists_p (file))
+          if (!file_exists_p (file, NULL))
             {
               xfree (file);
             }
-          xfree (home);
         }
     }
 #endif /* WINDOWS */
@@ -637,7 +675,7 @@ static bool setval_internal_tilde (int, const char *, const char *);
    there were errors in the file.  */
 
 bool
-run_wgetrc (const char *file)
+run_wgetrc (const char *file, file_stats_t *flstats)
 {
   FILE *fp;
   char *line = NULL;
@@ -645,7 +683,7 @@ run_wgetrc (const char *file)
   int ln;
   int errcnt = 0;
 
-  fp = fopen (file, "r");
+  fp = fopen_stat (file, "r", flstats);
   if (!fp)
     {
       fprintf (stderr, _("%s: Cannot read %s (%s).\n"), exec_name,
@@ -697,18 +735,20 @@ run_wgetrc (const char *file)
 
 /* Initialize the defaults and run the system wgetrc and user's own
    wgetrc.  */
-void
+int
 initialize (void)
 {
-  char *file, *env_sysrc;
+  char *env_sysrc;
+  file_stats_t flstats;
   bool ok = true;
 
+  memset(&flstats, 0, sizeof(flstats));
   /* Run a non-standard system rc file when the according environment
      variable has been set. For internal testing purposes only!  */
   env_sysrc = getenv ("SYSTEM_WGETRC");
-  if (env_sysrc && file_exists_p (env_sysrc))
+  if (env_sysrc && file_exists_p (env_sysrc, &flstats))
     {
-      ok &= run_wgetrc (env_sysrc);
+      ok &= run_wgetrc (env_sysrc, &flstats);
       /* If there are any problems parsing the system wgetrc file, tell
          the user and exit */
       if (! ok)
@@ -717,13 +757,13 @@ initialize (void)
 Parsing system wgetrc file (env SYSTEM_WGETRC) failed.  Please check\n\
 '%s',\n\
 or specify a different file using --config.\n"), env_sysrc);
-          exit (WGET_EXIT_PARSE_ERROR);
+          return WGET_EXIT_PARSE_ERROR;
         }
     }
   /* Otherwise, if SYSTEM_WGETRC is defined, use it.  */
 #ifdef SYSTEM_WGETRC
-  else if (file_exists_p (SYSTEM_WGETRC))
-    ok &= run_wgetrc (SYSTEM_WGETRC);
+  else if (file_exists_p (SYSTEM_WGETRC, &flstats))
+    ok &= run_wgetrc (SYSTEM_WGETRC, &flstats);
   /* If there are any problems parsing the system wgetrc file, tell
      the user and exit */
   if (! ok)
@@ -732,32 +772,36 @@ or specify a different file using --config.\n"), env_sysrc);
 Parsing system wgetrc file failed.  Please check\n\
 '%s',\n\
 or specify a different file using --config.\n"), SYSTEM_WGETRC);
-      exit (WGET_EXIT_PARSE_ERROR);
+      return WGET_EXIT_PARSE_ERROR;
     }
 #endif
   /* Override it with your own, if one exists.  */
-  file = wgetrc_file_name ();
-  if (!file)
-    return;
+  opt.wgetrcfile = wgetrc_file_name ();
+  if (!opt.wgetrcfile)
+    return 0;
   /* #### We should canonicalize `file' and SYSTEM_WGETRC with
      something like realpath() before comparing them with `strcmp'  */
 #ifdef SYSTEM_WGETRC
-  if (!strcmp (file, SYSTEM_WGETRC))
+  if (!strcmp (opt.wgetrcfile, SYSTEM_WGETRC))
     {
       fprintf (stderr, _("\
 %s: Warning: Both system and user wgetrc point to %s.\n"),
-               exec_name, quote (file));
+               exec_name, quote (opt.wgetrcfile));
     }
   else
 #endif
-    ok &= run_wgetrc (file);
+#ifndef FUZZING
+    if (file_exists_p (opt.wgetrcfile, &flstats))
+#endif
+      ok &= run_wgetrc (opt.wgetrcfile, &flstats);
+
+  xfree (opt.wgetrcfile);
 
   /* If there were errors processing either `.wgetrc', abort. */
   if (!ok)
-    exit (WGET_EXIT_PARSE_ERROR);
+    return WGET_EXIT_PARSE_ERROR;
 
-  xfree (file);
-  return;
+  return 0;
 }
 
 /* Remove dashes and underscores from S, modifying S in the
@@ -847,8 +891,10 @@ parse_line (const char *line, char **com, char **val, int *comind)
 
 #if defined(WINDOWS) || defined(MSDOS)
 # define ISSEP(c) ((c) == '/' || (c) == '\\')
+# define SEPSTRING "/\\"
 #else
 # define ISSEP(c) ((c) == '/')
+# define SEPSTRING "/"
 #endif
 
 /* Run commands[comind].action. */
@@ -857,6 +903,10 @@ static bool
 setval_internal (int comind, const char *com, const char *val)
 {
   assert (0 <= comind && ((size_t) comind) < countof (commands));
+
+  if ((unsigned) comind >= countof (commands))
+    return NULL;
+
   DEBUGP (("Setting %s (%s) to %s\n", com, commands[comind].name, val));
   return commands[comind].action (com, val, commands[comind].place);
 }
@@ -866,7 +916,6 @@ setval_internal_tilde (int comind, const char *com, const char *val)
 {
   bool ret;
   int homelen;
-  char *home;
   char **pstring;
   ret = setval_internal (comind, com, val);
 
@@ -876,17 +925,19 @@ setval_internal_tilde (int comind, const char *com, const char *val)
       && ret && (*val == '~' && ISSEP (val[1])))
     {
       pstring = commands[comind].place;
-      home = home_dir ();
-      if (home)
+      if (opt.homedir)
         {
+          char *home = xstrdup(opt.homedir);
           homelen = strlen (home);
           while (homelen && ISSEP (home[homelen - 1]))
                  home[--homelen] = '\0';
 
+          xfree (*pstring);
+
           /* Skip the leading "~/". */
-          for (++val; ISSEP (*val); val++)
-            ;
+          val += strspn(val + 1, SEPSTRING) + 1;
           *pstring = concat_strings (home, "/", val, (char *)0);
+          xfree (home);
         }
     }
   return ret;
@@ -948,7 +999,6 @@ struct decode_item {
   int code;
 };
 static bool decode_string (const char *, const struct decode_item *, int, int *);
-static bool simple_atoi (const char *, const char *, int *);
 static bool simple_atof (const char *, const char *, double *);
 
 #define CMP1(p, c0) (c_tolower((p)[0]) == (c0) && (p)[1] == '\0')
@@ -1043,13 +1093,16 @@ cmd_check_cert (const char *com, const char *val, void *place)
 static bool
 cmd_number (const char *com, const char *val, void *place)
 {
-  if (!simple_atoi (val, val + strlen (val), place)
-      || *(int *) place < 0)
+  long l = strtol(val, NULL, 10);
+
+  if (((l == LONG_MIN || l == LONG_MAX) && errno == ERANGE)
+      || l < 0 || l > INT_MAX)
     {
       fprintf (stderr, _("%s: %s: Invalid number %s.\n"),
                exec_name, com, quote (val));
       return false;
     }
+  *(int *) place = (int) l;
   return true;
 }
 
@@ -1299,7 +1352,9 @@ static bool
 cmd_bytes_sum (const char *com, const char *val, void *place)
 {
   double byte_value;
-  if (!parse_bytes_helper (val, &byte_value))
+
+  if (!parse_bytes_helper (val, &byte_value)
+      || byte_value < LONG_MIN || byte_value > LONG_MAX)
     {
       fprintf (stderr, _("%s: %s: Invalid byte value %s\n"),
                exec_name, com, quote (val));
@@ -1369,6 +1424,32 @@ cmd_time (const char *com, const char *val, void *place)
   return true;
 }
 
+
+static bool
+cmd_use_askpass (const char *com _GL_UNUSED, const char *val, void *place)
+{
+  const char *env_name = "WGET_ASKPASS";
+  const char *env;
+
+  if (val && *val)
+    return cmd_string (com, val, place);
+
+  env = getenv (env_name);
+  if (!(env && *env))
+    {
+      env_name = "SSH_ASKPASS";
+      env = getenv (env_name);
+    }
+
+  if (!(env && *env))
+    {
+      fprintf (stderr, _("use-askpass requires a string or either environment variable WGET_ASKPASS or SSH_ASKPASS to be set.\n"));
+      return false;
+    }
+
+  return cmd_string (com, env, place);
+}
+
 #ifdef HAVE_SSL
 static bool
 cmd_cert_type (const char *com, const char *val, void *place)
@@ -1389,6 +1470,25 @@ cmd_cert_type (const char *com, const char *val, void *place)
    options specially.  */
 
 static bool check_user_specified_header (const char *);
+
+#ifdef HAVE_LIBZ
+static bool
+cmd_spec_compression (const char *com, const char *val, void *place)
+{
+  static const struct decode_item choices[] = {
+    { "auto", compression_auto },
+    { "gzip", compression_gzip },
+    { "none", compression_none },
+  };
+  int ok = decode_string (val, choices, countof (choices), place);
+  if (!ok)
+    {
+      fprintf (stderr, _("%s: %s: Invalid value %s.\n"), exec_name, com,
+               quote (val));
+    }
+  return ok;
+}
+#endif
 
 static bool
 cmd_spec_dirstruct (const char *com, const char *val, void *place_ignored _GL_UNUSED)
@@ -1461,7 +1561,7 @@ cmd_spec_htmlify (const char *com, const char *val, void *place_ignored _GL_UNUS
 static bool
 cmd_spec_mirror (const char *com, const char *val, void *place_ignored _GL_UNUSED)
 {
-  int mirror;
+  bool mirror;
 
   if (!cmd_boolean (com, val, &mirror))
     return false;
@@ -1540,7 +1640,7 @@ cmd_spec_regex_type (const char *com, const char *val, void *place_ignored _GL_U
 {
   static const struct decode_item choices[] = {
     { "posix", regex_type_posix },
-#ifdef HAVE_LIBPCRE
+#if defined HAVE_LIBPCRE || defined HAVE_LIBPCRE2
     { "pcre",  regex_type_pcre },
 #endif
   };
@@ -1628,6 +1728,7 @@ cmd_spec_secure_protocol (const char *com, const char *val, void *place)
     { "tlsv1", secure_protocol_tlsv1 },
     { "tlsv1_1", secure_protocol_tlsv1_1 },
     { "tlsv1_2", secure_protocol_tlsv1_2 },
+    { "tlsv1_3", secure_protocol_tlsv1_3 },
     { "pfs", secure_protocol_pfs },
   };
   int ok = decode_string (val, choices, countof (choices), place);
@@ -1700,54 +1801,6 @@ cmd_spec_verbose (const char *com, const char *val, void *place_ignored _GL_UNUS
 }
 
 /* Miscellaneous useful routines.  */
-
-/* A very simple atoi clone, more useful than atoi because it works on
-   delimited strings, and has error reportage.  Returns true on success,
-   false on failure.  If successful, stores result to *DEST.  */
-
-static bool
-simple_atoi (const char *beg, const char *end, int *dest)
-{
-  int result = 0;
-  bool negative = false;
-  const char *p = beg;
-
-  while (p < end && c_isspace (*p))
-    ++p;
-  if (p < end && (*p == '-' || *p == '+'))
-    {
-      negative = (*p == '-');
-      ++p;
-    }
-  if (p == end)
-    return false;
-
-  /* Read negative numbers in a separate loop because the most
-     negative integer cannot be represented as a positive number.  */
-
-  if (!negative)
-    for (; p < end && c_isdigit (*p); p++)
-      {
-        int next = (10 * result) + (*p - '0');
-        if (next < result)
-          return false;         /* overflow */
-        result = next;
-      }
-  else
-    for (; p < end && c_isdigit (*p); p++)
-      {
-        int next = (10 * result) - (*p - '0');
-        if (next > result)
-          return false;         /* underflow */
-        result = next;
-      }
-
-  if (p != end)
-    return false;
-
-  *dest = result;
-  return true;
-}
 
 /* Trivial atof, with error reporting.  Handles "<digits>[.<digits>]",
    doesn't handle exponential notation.  Returns true on success,
@@ -1841,11 +1894,17 @@ decode_string (const char *val, const struct decode_item *items, int itemcount,
   return false;
 }
 
+extern struct ptimer *timer;
+extern int cleaned_up;
+
 /* Free the memory allocated by global variables.  */
 void
 cleanup (void)
 {
   /* Free external resources, close files, etc. */
+
+  if (cleaned_up++)
+    return; /* cleanup() must not be called twice */
 
   /* Close WARC file. */
   if (opt.warc_filename != 0)
@@ -1853,9 +1912,13 @@ cleanup (void)
 
   log_close ();
 
-  if (output_stream)
-    if (fclose (output_stream) == EOF)
-      inform_exit_status (CLOSEFAILED);
+  if (output_stream && output_stream != stderr)
+    {
+      FILE *fp = output_stream;
+      output_stream = NULL;
+      if (fclose (fp) == EOF)
+        inform_exit_status (CLOSEFAILED);
+    }
 
   /* No need to check for error because Wget flushes its output (and
      checks for errors) after any data arrives.  */
@@ -1863,12 +1926,12 @@ cleanup (void)
   /* We're exiting anyway so there's no real need to call free()
      hundreds of times.  Skipping the frees will make Wget exit
      faster.
-
+   *
      However, when detecting leaks, it's crucial to free() everything
      because then you can find the real leaks, i.e. the allocated
      memory which grows with the size of the program.  */
 
-#ifdef DEBUG_MALLOC
+#if defined DEBUG_MALLOC || defined TESTING
   convert_cleanup ();
   res_cleanup ();
   http_cleanup ();
@@ -1887,24 +1950,43 @@ cleanup (void)
   xfree (opt.preferred_location);
 #endif
   xfree (opt.output_document);
+  xfree (opt.default_page);
+  if (opt.regex_type == regex_type_posix)
+    {
+      if (opt.acceptregex)
+        regfree (opt.acceptregex);
+      if (opt.rejectregex)
+        regfree (opt.rejectregex);
+    }
+  xfree (opt.acceptregex);
+  xfree (opt.rejectregex);
+  xfree (opt.acceptregex_s);
+  xfree (opt.rejectregex_s);
   free_vec (opt.accepts);
   free_vec (opt.rejects);
   free_vec ((char **)opt.excludes);
   free_vec ((char **)opt.includes);
   free_vec (opt.domains);
+  free_vec (opt.exclude_domains);
   free_vec (opt.follow_tags);
   free_vec (opt.ignore_tags);
   xfree (opt.progress_type);
+  xfree (opt.warc_filename);
+  xfree (opt.warc_tempdir);
+  xfree (opt.warc_cdx_dedup_filename);
   xfree (opt.ftp_user);
   xfree (opt.ftp_passwd);
   xfree (opt.ftp_proxy);
   xfree (opt.https_proxy);
   xfree (opt.http_proxy);
   free_vec (opt.no_proxy);
+  xfree (opt.proxy_user);
+  xfree (opt.proxy_passwd);
   xfree (opt.useragent);
   xfree (opt.referer);
   xfree (opt.http_user);
   xfree (opt.http_passwd);
+  xfree (opt.dot_style);
   free_vec (opt.user_headers);
   free_vec (opt.warc_user_headers);
 # ifdef HAVE_SSL
@@ -1913,6 +1995,7 @@ cleanup (void)
   xfree (opt.ca_directory);
   xfree (opt.ca_cert);
   xfree (opt.crl_file);
+  xfree (opt.pinnedpubkey);
   xfree (opt.random_file);
   xfree (opt.egd_file);
 # endif
@@ -1928,8 +2011,34 @@ cleanup (void)
   xfree (opt.body_data);
   xfree (opt.body_file);
   xfree (opt.rejected_log);
+  xfree (opt.use_askpass);
+  xfree (opt.retry_on_http_error);
 
-#endif /* DEBUG_MALLOC */
+  xfree (opt.encoding_remote);
+  xfree (opt.locale);
+  xfree (opt.hsts_file);
+
+  xfree (opt.wgetrcfile);
+  xfree (opt.homedir);
+  xfree (exec_name);
+  xfree (program_argstring);
+  ptimer_destroy (timer); timer = NULL;
+
+#ifdef HAVE_LIBCARES
+#include <ares.h>
+  {
+    extern ares_channel ares;
+
+    xfree (opt.bind_dns_address);
+    xfree (opt.dns_servers);
+    ares_destroy (ares);
+    ares_library_cleanup ();
+  }
+#endif
+
+  quotearg_free ();
+
+#endif /* DEBUG_MALLOC || TESTING */
 }
 
 /* Unit testing routines.  */

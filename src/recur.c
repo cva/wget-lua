@@ -1,7 +1,5 @@
 /* Handling of recursive HTTP retrieving.
-   Copyright (C) 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004,
-   2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2015 Free Software
-   Foundation, Inc.
+   Copyright (C) 1996-2012, 2015, 2018 Free Software Foundation, Inc.
 
 This file is part of GNU Wget.
 
@@ -237,17 +235,19 @@ retrieve_tree (struct url *start_url_parsed, struct iri *pi)
 
   FILE *rejectedlog = NULL; /* Don't write a rejected log. */
 
-#define COPYSTR(x)  (x) ? xstrdup(x) : NULL;
   /* Duplicate pi struct if not NULL */
   if (pi)
     {
+#define COPYSTR(x)  (x) ? xstrdup(x) : NULL;
       i->uri_encoding = COPYSTR (pi->uri_encoding);
       i->content_encoding = COPYSTR (pi->content_encoding);
       i->utf8_encode = pi->utf8_encode;
+#undef COPYSTR
     }
+#ifdef ENABLE_IRI
   else
     set_uri_encoding (i, opt.locale, true);
-#undef COPYSTR
+#endif
 
   queue = url_queue_new ();
   blacklist = make_string_hash_table (0);
@@ -462,9 +462,14 @@ retrieve_tree (struct url *start_url_parsed, struct iri *pi)
               struct url *url_parsed = url_parse (url, NULL, i, true);
               struct iri *ci;
               char *referer_url = url;
-              bool strip_auth = (url_parsed != NULL
-                                 && url_parsed->user != NULL);
+              bool strip_auth;
+
               assert (url_parsed != NULL);
+
+              if (!url_parsed)
+                continue;
+
+              strip_auth = (url_parsed && url_parsed->user);
 
               /* Strip auth info if present */
               if (strip_auth)
@@ -475,9 +480,16 @@ retrieve_tree (struct url *start_url_parsed, struct iri *pi)
                   reject_reason r;
 
                   if (child->ignore_when_downloading)
-                    continue;
+                    {
+                      DEBUGP (("Not following due to 'ignore' flag: %s\n", child->url->url));
+                      continue;
+                    }
+
                   if (dash_p_leaf_HTML && !child->link_inline_p)
-                    continue;
+                    {
+                      DEBUGP (("Not following due to 'link inline' flag: %s\n", child->url->url));
+                      continue;
+                    }
 
                   r = download_child (child, url_parsed, depth,
                                       start_url_parsed, blacklist, i);
@@ -539,7 +551,7 @@ retrieve_tree (struct url *start_url_parsed, struct iri *pi)
 
       if (file
           && (opt.delete_after
-              || opt.spider /* opt.recursive is implicitely true */
+              || opt.spider /* opt.recursive is implicitly true */
               || !acceptable (file)))
         {
           /* Either --delete-after was specified, or we loaded this
@@ -570,7 +582,10 @@ retrieve_tree (struct url *start_url_parsed, struct iri *pi)
     }
 
   if (rejectedlog)
-    fclose (rejectedlog);
+    {
+      fclose (rejectedlog);
+      rejectedlog = NULL;
+    }
 
   /* If anything is left of the queue due to a premature exit, free it
      now.  */
@@ -746,7 +761,7 @@ download_child (const struct urlpos *upos, struct url *parent, int depth,
      for directories (no file name to match) and for non-leaf HTMLs,
      which can lead to other files that do need to be downloaded.  (-p
      automatically implies non-leaf because with -p we can, if
-     necesary, overstep the maximum depth to get the page requisites.)  */
+     necessary, overstep the maximum depth to get the page requisites.)  */
   if (u->file[0] != '\0'
       && !(has_html_suffix_p (u->file)
            /* The exception only applies to non-leaf HTMLs (but -p
@@ -870,6 +885,12 @@ descend_redirect (const char *redirected, struct url *orig_parsed, int depth,
 
   if (reason == WG_RR_SUCCESS)
     blacklist_add (blacklist, upos->url->url);
+  else if (reason == WG_RR_LIST || reason == WG_RR_REGEX)
+    {
+      DEBUGP (("Ignoring decision for redirects, decided to load it.\n"));
+      blacklist_add (blacklist, upos->url->url);
+      reason = WG_RR_SUCCESS;
+    }
   else
     DEBUGP (("Redirection \"%s\" failed the test.\n", redirected));
 

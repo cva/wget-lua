@@ -1,6 +1,6 @@
 dnl Template file for GNU Autoconf
-dnl Copyright (C) 1995, 1996, 1997, 2001, 2007, 2008, 2009, 2010, 2011, 2012,
-dnl 2013, 2014 Free Software Foundation, Inc.
+dnl Copyright (C) 1995-1997, 2001, 2007-2014, 2018 Free Software
+dnl Foundation, Inc.
 
 dnl This program is free software; you can redistribute it and/or modify
 dnl it under the terms of the GNU General Public License as published by
@@ -33,7 +33,7 @@ dnl
 AC_INIT([wget],
         m4_esyscmd([build-aux/git-version-gen .tarball-version]),
 	[bug-wget@gnu.org])
-AC_PREREQ(2.61)
+AC_PREREQ(2.63)
 
 dnl
 dnl What version of Wget are we building?
@@ -57,6 +57,8 @@ AC_CANONICAL_HOST
 AC_DEFINE_UNQUOTED([OS_TYPE], "$host_os",
                    [Define to be the name of the operating system.])
 
+dnl Non-verbose make
+m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
 dnl
 dnl Process External Libraries
@@ -70,7 +72,6 @@ dnl SSL: Configure SSL backend to use
 AC_ARG_WITH([ssl],
   [AS_HELP_STRING([--with-ssl={gnutls,openssl}], [specify SSL backend. GNU TLS is the default.])])
 
-
 dnl Zlib: Configure use of zlib for compression
 AC_ARG_WITH([zlib],
   [AS_HELP_STRING([--without-zlib], [disable zlib.])])
@@ -79,9 +80,28 @@ dnl Metalink: Configure use of the Metalink library
 AC_ARG_WITH([metalink],
   [AS_HELP_STRING([--with-metalink], [enable support for metalinks.])])
 
+dnl C-Ares: Configure use of the c-ares library for DNS lookup
+AC_ARG_WITH(cares, AS_HELP_STRING([--with-cares], [enable support for C-Ares DNS lookup.]), with_cares=$withval, with_cares=no)
+
 dnl
 dnl Process features
 dnl
+
+AC_ARG_ENABLE([fuzzing],
+  [AS_HELP_STRING([--enable-fuzzing], [Turn on fuzzing build (for developers)])],
+  [enable_fuzzing=yes;
+   AC_SUBST([LIB_FUZZING_ENGINE])
+   AC_DEFINE([FUZZING], 1, [Define to 1 if this is a fuzzing build])
+  ], [enable_fuzzing=no; LIB_FUZZING_ENGINE=""])
+#FUZZ_LIBS=$LIBS
+#if test $enable_fuzzing = "yes"; then
+#  OLD_LIBS=$LIBS
+#  AC_SEARCH_LIBS([dlsym], [dl dld])
+#  FUZZ_LIBS=$LIBS
+#  LIBS=$OLD_LIBS
+#fi
+#AC_SUBST([FUZZ_LIBS])
+AM_CONDITIONAL([FUZZING], [test "$enable_fuzzing" = "yes"])
 
 dnl Opie: Support for opie s/key FTP logins
 AC_ARG_ENABLE([opie],
@@ -180,7 +200,7 @@ dnl
 dnl Gettext
 dnl
 AM_GNU_GETTEXT([external],[need-ngettext])
-AM_GNU_GETTEXT_VERSION([0.18.1])
+AM_GNU_GETTEXT_VERSION([0.17])
 
 AC_PROG_RANLIB
 
@@ -233,7 +253,7 @@ dnl
 AC_HEADER_STDBOOL
 AC_CHECK_HEADERS(unistd.h sys/time.h)
 AC_CHECK_HEADERS(termios.h sys/ioctl.h sys/select.h utime.h sys/utime.h)
-AC_CHECK_HEADERS(stdint.h inttypes.h pwd.h wchar.h)
+AC_CHECK_HEADERS(stdint.h inttypes.h pwd.h wchar.h dlfcn.h)
 
 AC_CHECK_DECLS(h_errno,,,[#include <netdb.h>])
 
@@ -271,7 +291,7 @@ AC_FUNC_MMAP
 AC_FUNC_FSEEKO
 AC_CHECK_FUNCS(strptime timegm vsnprintf vasprintf drand48 pathconf)
 AC_CHECK_FUNCS(strtoll usleep ftello sigblock sigsetjmp memrchr wcwidth mbtowc)
-AC_CHECK_FUNCS(sleep symlink utime strlcpy random)
+AC_CHECK_FUNCS(sleep symlink utime strlcpy random fmemopen)
 
 if test x"$ENABLE_OPIE" = xyes; then
   AC_LIBOBJ([ftp-opie])
@@ -285,15 +305,6 @@ AC_DEFINE([HAVE_STRCASECMP], 1, [Define to 1 if you have the `strcasecmp' functi
 AC_DEFINE([HAVE_STRNCASECMP], 1, [Define to 1 if you have the `strncasecmp' function.])
 AC_DEFINE([HAVE_STRDUP], 1, [Define to 1 if you have the `strdup' function.])
 AC_DEFINE([HAVE_ISATTY], 1, [Define to 1 if you have the `isatty' function.])
-
-dnl
-dnl Call Wget-specific macros defined in aclocal.
-dnl
-WGET_STRUCT_UTIMBUF
-WGET_FNMATCH
-WGET_NANOSLEEP
-WGET_POSIX_CLOCK
-WGET_NSL_SOCKET
 
 dnl Deal with specific hosts
 case $host_os in
@@ -323,6 +334,10 @@ AS_IF([test "x$with_libpsl" != xno], [
       [with_libpsl=yes; AC_DEFINE([HAVE_LIBPSL], [1], [PSL support enabled])],
       [with_libpsl=no;  AC_MSG_WARN(*** libpsl was not found. Fallback to builtin cookie checking.)])
   ])
+])
+
+AS_IF([test x"$with_libpsl" = xyes], [
+  AC_CHECK_FUNCS(psl_latest)
 ])
 
 AS_IF([test x"$with_zlib" != xno], [
@@ -478,35 +493,6 @@ else
   fi
 fi
 
-dnl
-dnl Check for libmetalink
-dnl
-AS_IF([test x"$with_metalink" != xno], [
-  PKG_CHECK_MODULES([METALINK], libmetalink, [
-      LIBS="$METALINK_LIBS $LIBS"
-      CFLAGS="$METALINK_CFLAGS $CFLAGS"
-      AC_DEFINE([HAVE_METALINK], [1], [Define if using metalink.])
-      with_metalink=yes
-    ], [
-      with_metalink=no
-    ])
-
-  have_gpg=no
-  AS_IF([test x"$with_metalink" = xyes], [
-    dnl
-    dnl Check for GPGME
-    dnl
-    m4_ifdef([AM_PATH_GPGME], [
-      AM_PATH_GPGME([], [
-        LIBS="$GPGME_LIBS $LIBS"
-        CFLAGS="$GPGME_CFLAGS $CFLAGS"
-        AC_DEFINE([HAVE_GPGME], [1], [Define if GPGME is available.])
-        have_gpg=yes
-      ])
-    ])
-  ])
-])
-
 dnl **********************************************************************
 dnl Checks for IPv6
 dnl **********************************************************************
@@ -631,9 +617,6 @@ AC_ARG_ENABLE(iri,
   ]
 )
 
-AC_ARG_WITH(libidn, AC_HELP_STRING([--with-libidn=[DIR]],
-                                   [Support IDN/IRIs (needs GNU Libidn)]),
-                                   libidn=$withval, libidn="")
 AS_IF([test "X$iri" != "Xno"],[
   AM_ICONV
 
@@ -645,39 +628,23 @@ AS_IF([test "X$iri" != "Xno"],[
       AC_MSG_NOTICE([disabling IRIs because libiconv wasn't found])
     fi
   fi
-],[  # else
-  # For some reason, this seems to be set even when we don't check.
-  # Explicitly unset.
-  LIBICONV=
 ])
 
+AC_ARG_WITH(libidn, AC_HELP_STRING([--with-libidn=[DIR]],
+                                   [Support IDN2008/IRIs (needs GNU libidn2 + libunicode)]),
+                                   libidn=$withval, libidn="")
 if test "X$iri" != "Xno"; then
-  if test "$libidn" != ""; then
-    LDFLAGS="${LDFLAGS} -L$libidn/lib"
-    CPPFLAGS="${CPPFLAGS} -I$libidn/include"
-  fi
+  AS_IF([test "x$with_libidn2" != xno], [
+    AC_SEARCH_LIBS(idn2_lookup_u8, idn2,
+      [with_libidn2=yes; AC_DEFINE([ENABLE_IRI], 1, [Define if IRI support is enabled.])],
+      [with_libidn2=no; iri=no; AC_MSG_WARN(*** LIBIDN2 was not found. You will not be able to use IDN2008 support)])
 
-  # If idna.h can't be found, check to see if it was installed under
-  # /usr/include/idn (OpenSolaris, at least, places it there).
-  # Check for idn-int.h in that case, because idna.h won't find
-  # idn-int.h until we've decided to add -I/usr/include/idn.
-  AC_CHECK_HEADER(idna.h, ,
-    [AC_CHECK_HEADER(idn/idn-int.h,
-                    [CPPFLAGS="${CPPFLAGS} -I/usr/include/idn"],
-                    [iri=no])]
-  )
-
-  if test "X$iri" != "Xno"; then
-    AC_CHECK_LIB(idn, stringprep_check_version,
-      [iri=yes LIBS="${LIBS} -lidn"], iri=no)
-  fi
-
-  if test "X$iri" != "Xno" ; then
-    AC_DEFINE([ENABLE_IRI], 1, [Define if IRI support is enabled.])
-    AC_MSG_NOTICE([Enabling support for IRI.])
-  else
-    AC_MSG_WARN([Libidn not found])
-  fi
+#    AS_IF([test "x$with_libidn2" = xyes], [
+#      AC_SEARCH_LIBS(u8_tolower, unistring,
+#        [AC_DEFINE([ENABLE_IRI], 1, [Define if IRI support is enabled.])],
+#        [iri=no; AC_MSG_WARN(*** LIBUNISTRING was not found. You will not be able to use IDN2008 support)])
+#    ])
+  ])
 fi
 
 dnl
@@ -719,18 +686,39 @@ AS_IF([test "x$uuid_mode" = x1], [
 ])
 
 dnl
-dnl Check for PCRE
+dnl Check for PCRE2 / PCRE
 dnl
 
+AC_ARG_ENABLE(pcre2, AC_HELP_STRING([--disable-pcre2],
+                                   [Disable PCRE2 style regular expressions]))
 AC_ARG_ENABLE(pcre, AC_HELP_STRING([--disable-pcre],
                                    [Disable PCRE style regular expressions]))
 
-AS_IF([test "X$enable_pcre" != "Xno"],[
+AS_IF([test "X$enable_pcre2" != "Xno"],[
+  enable_pcre2=no
+  PKG_CHECK_MODULES([PCRE2], libpcre2-8, [
+    CFLAGS="$PCRE2_CFLAGS $CFLAGS"
+    LIBS="$PCRE2_LIBS $LIBS"
+    AC_DEFINE([HAVE_LIBPCRE2], [1], [Define if libpcre2 is available.])
+    enable_pcre2=yes
+  ], [
+    AC_CHECK_HEADER(pcre2.h, [
+      AC_CHECK_LIB(pcre2-8, pcre2_compile_8, [
+        LIBS="${LIBS} -lpcre2-8"
+        AC_DEFINE([HAVE_LIBPCRE2], 1, [Define if libpcre2 is available.])
+        enable_pcre2=yes
+      ])
+    ])
+  ])
+])
+
+AS_IF([test "X$enable_pcre" != "Xno" && test "X$enable_pcre2" != "Xyes"],[
   PKG_CHECK_MODULES([PCRE], libpcre, [
     CFLAGS="$PCRE_CFLAGS $CFLAGS"
     AC_CHECK_HEADER(pcre.h, [
       LIBS="$PCRE_LIBS $LIBS"
       AC_DEFINE([HAVE_LIBPCRE], [1], [Define if libpcre is available.])
+      enable_pcre=yes
     ])
   ], [
     AC_CHECK_HEADER(pcre.h, [
@@ -742,6 +730,90 @@ AS_IF([test "X$enable_pcre" != "Xno"],[
   ])
 ])
 
+AS_IF([test "X$enable_pcre2" = Xyes], [PCRE_INFO="yes, via libpcre2"], [test "X$enable_pcre" = Xyes], [PCRE_INFO="yes, via libpcre"], [PCRE_INFO=no])
+
+dnl
+dnl Check for libcares (resolver library)
+dnl
+
+AS_IF([test "X$with_cares" = "Xyes"],[
+  PKG_CHECK_MODULES([CARES], libcares, [
+    CFLAGS="$CARES_CFLAGS $CFLAGS"
+    AC_CHECK_HEADER(ares.h, [
+      LIBS="$CARES_LIBS $LIBS"
+      AC_DEFINE([HAVE_LIBCARES], [1], [Define if libcares is available.])
+      RESOLVER_INFO="libcares, --bind-dns-address and --dns-servers available"
+    ])
+  ], [
+    AC_CHECK_HEADER(ares.h, [
+      AC_CHECK_LIB(cares, ares_set_local_ip4, [
+        LIBS="-lcares ${LIBS}"
+        AC_DEFINE([HAVE_LIBCARES], 1, [Define if libcares is available.])
+        RESOLVER_INFO="libcares, --bind-dns-address and --dns-servers available"
+      ])
+    ])
+  ])
+], [
+  RESOLVER_INFO="libc, --bind-dns-address and --dns-servers not available"
+])
+
+dnl
+dnl Check for libmetalink
+dnl
+AS_IF([test x"$with_metalink" != xno], [
+  PKG_CHECK_MODULES([METALINK], libmetalink, [
+      LIBS="$METALINK_LIBS $LIBS"
+      CFLAGS="$METALINK_CFLAGS $CFLAGS"
+      AC_DEFINE([HAVE_METALINK], [1], [Define if using metalink.])
+      with_metalink=yes
+    ], [
+      with_metalink=no
+    ])
+
+  have_gpg=no
+  AS_IF([test x"$with_metalink" = xyes], [
+    dnl
+    dnl Check for GPGME
+    dnl
+    m4_ifdef([AM_PATH_GPGME], [
+      AM_PATH_GPGME([], [
+        # Put libgpgme to the end of the library list since it introduces a -L linker flags.
+        # That -L might break the build if there are two different version of
+        # a library (e.g. GnuTLS) in /usr/local and in the system directory.
+        LIBS="$LIBS $GPGME_LIBS"
+        CFLAGS="$GPGME_CFLAGS $CFLAGS"
+        AC_DEFINE([HAVE_GPGME], [1], [Define if GPGME is available.])
+        have_gpg=yes
+      ])
+    ])
+  ])
+])
+
+dnl
+dnl Extended Attribute support
+dnl
+
+AC_ARG_ENABLE([xattr],
+  [AS_HELP_STRING([--disable-xattr], [disable support for POSIX Extended Attributes])],
+  [ENABLE_XATTR=$enableval],
+  [ENABLE_XATTR=yes])
+
+case "$host_os" in
+  *linux* | *darwin*) xattr_syscalls="fsetxattr" ;;
+  freebsd*)           xattr_syscalls="extattr_set_fd" ;;
+  *)  AC_MSG_NOTICE([Disabling Extended Attribute support: your system is not known to support extended attributes.])
+      ENABLE_XATTR=no
+esac
+
+if test "X${ENABLE_XATTR}" = "Xyes"; then
+  AC_CHECK_FUNCS([$xattr_syscalls], [], [
+    AC_MSG_NOTICE([Disabling Extended Attribute support: your system does not support $xattr_syscalls])
+    ENABLE_XATTR=no
+  ])
+fi
+
+test "X${ENABLE_XATTR}" = "Xyes" && AC_DEFINE([ENABLE_XATTR], 1,
+    [Define if you want file meta-data storing into POSIX Extended Attributes compiled in.])
 
 dnl
 dnl Check for Lua
@@ -772,13 +844,15 @@ dnl Needed by src/Makefile.am
 AM_CONDITIONAL([IRI_IS_ENABLED], [test "X$iri" != "Xno"])
 AM_CONDITIONAL([WITH_SSL], [test "X$with_ssl" != "Xno"])
 AM_CONDITIONAL([METALINK_IS_ENABLED], [test "X$with_metalink" != "Xno"])
+AM_CONDITIONAL([WITH_XATTR], [test "X$ENABLE_XATTR" != "Xno"])
 
 dnl
 dnl Create output
 dnl
 AC_CONFIG_FILES([Makefile src/Makefile doc/Makefile util/Makefile
-                 po/Makefile.in tests/Makefile
-                 lib/Makefile testenv/Makefile])
+                 po/Makefile.in tests/Makefile fuzz/Makefile
+                 lib/Makefile testenv/Makefile
+                 tests/certs/interca.conf tests/certs/rootca.conf])
 AC_CONFIG_HEADERS([src/config.h])
 AC_OUTPUT
 
@@ -794,12 +868,17 @@ AC_MSG_NOTICE([Summary of build options:
   SSL:               $with_ssl
   Zlib:              $with_zlib
   PSL:               $with_libpsl
+  PCRE:              $PCRE_INFO
   Digest:            $ENABLE_DIGEST
   NTLM:              $ENABLE_NTLM
   OPIE:              $ENABLE_OPIE
+  POSIX xattr:       $ENABLE_XATTR
   Debugging:         $ENABLE_DEBUG
   Assertions:        $ENABLE_ASSERTION
   Valgrind:          $VALGRIND_INFO
   Metalink:          $with_metalink
+  Resolver:          $RESOLVER_INFO
   GPGME:             $have_gpg
+  IRI:               $iri
+  Fuzzing build:     $enable_fuzzing, $LIB_FUZZING_ENGINE
 ])

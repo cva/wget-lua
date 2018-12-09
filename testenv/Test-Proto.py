@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 from sys import exit
 from test.http_test import HTTPTest
-from misc.constants import HTTP, HTTPS
+from test.base_test import HTTP, HTTPS
 from misc.wget_file import WgetFile
 
 """
     This is a Prototype Test File.
     Ideally this File should be copied and edited to write new tests.
 """
-TEST_NAME = "Prototype"
 ############# File Definitions ###############################################
 File1 = "Would you like some Tea?"
 File2 = "With lemon or cream?"
@@ -65,7 +64,6 @@ post_test = {
 }
 
 err = HTTPTest (
-                name=TEST_NAME,
                 pre_hook=pre_test,
                 test_params=test_options,
                 post_hook=post_test,

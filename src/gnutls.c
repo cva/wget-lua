@@ -1,6 +1,5 @@
 /* SSL support via GnuTLS library.
-   Copyright (C) 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2015
-   Free Software Foundation, Inc.
+   Copyright (C) 2005-2012, 2015, 2018 Free Software Foundation, Inc.
 
 This file is part of GNU Wget.
 
@@ -36,7 +35,9 @@ as that of the covered work.  */
 #include <stdio.h>
 #include <dirent.h>
 #include <stdlib.h>
+#include <xalloc.h>
 
+#include <gnutls/abstract.h>
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
 #include <sys/ioctl.h>
@@ -48,7 +49,7 @@ as that of the covered work.  */
 #include "hash.h"
 #include "ssl.h"
 
-#include <sys/fcntl.h>
+#include <fcntl.h>
 
 #ifdef WIN32
 # include "w32sock.h"
@@ -58,6 +59,11 @@ as that of the covered work.  */
 
 static int
 _do_handshake (gnutls_session_t session, int fd, double timeout);
+
+#if GNUTLS_VERSION_NUMBER >= 0x030604
+static int
+_do_reauth (gnutls_session_t session, int fd, double timeout);
+#endif
 
 static int
 key_type_to_gnutls_type (enum keyfile_type type)
@@ -286,6 +292,14 @@ wgnutls_read_timeout (int fd, char *buf, int bufsize, void *arg, double timeout)
               if ((ret = _do_handshake (ctx->session, fd, timeout)) == 0)
                 ret = GNUTLS_E_AGAIN; /* restart reading */
             }
+#if GNUTLS_VERSION_NUMBER >= 0x030604
+          if (!timed_out && ret == GNUTLS_E_REAUTH_REQUEST)
+            {
+              DEBUGP (("GnuTLS: *** re-authentication while reading\n"));
+              if ((ret = _do_reauth (ctx->session, fd, timeout)) == 0)
+                ret = GNUTLS_E_AGAIN; /* restart reading */
+            }
+#endif
         }
     }
   while (ret == GNUTLS_E_INTERRUPTED || (ret == GNUTLS_E_AGAIN && !timed_out));
@@ -496,7 +510,7 @@ _do_handshake (gnutls_session_t session, int fd, double timeout)
             {
               gnutls_alert_description_t alert = gnutls_alert_get (session);
               const char *str = gnutls_alert_get_name (alert);
-              logprintf (LOG_NOTQUIET, "GnuTLS: received alert [%d]: %s\n",
+              logprintf (LOG_NOTQUIET, "GnuTLS: received alert [%u]: %s\n",
                          alert, str ? str : "(unknown)");
             }
         }
@@ -518,38 +532,111 @@ _do_handshake (gnutls_session_t session, int fd, double timeout)
   return err;
 }
 
-bool
-ssl_connect_wget (int fd, const char *hostname, int *continue_session)
+#if GNUTLS_VERSION_NUMBER >= 0x030604
+static int
+_do_reauth (gnutls_session_t session, int fd, double timeout)
 {
-  struct wgnutls_transport_context *ctx;
-  gnutls_session_t session;
+#ifdef F_GETFL
+  int flags = 0;
+#endif
   int err;
 
-  gnutls_init (&session, GNUTLS_CLIENT);
-
-  /* We set the server name but only if it's not an IP address. */
-  if (! is_valid_ip_address (hostname))
+  if (timeout)
     {
-      gnutls_server_name_set (session, GNUTLS_NAME_DNS, hostname,
-                              strlen (hostname));
+#ifdef F_GETFL
+      flags = fcntl (fd, F_GETFL, 0);
+      if (flags < 0)
+        return flags;
+      if (fcntl (fd, F_SETFL, flags | O_NONBLOCK))
+        return -1;
+#else
+      /* XXX: Assume it was blocking before.  */
+      const int one = 1;
+      if (ioctl (fd, FIONBIO, &one) < 0)
+        return -1;
+#endif
     }
 
-  gnutls_set_default_priority (session);
-  gnutls_credentials_set (session, GNUTLS_CRD_CERTIFICATE, credentials);
-#ifndef FD_TO_SOCKET
-# define FD_TO_SOCKET(X) (X)
-#endif
-#ifdef HAVE_INTPTR_T
-  gnutls_transport_set_ptr (session, (gnutls_transport_ptr_t) (intptr_t) FD_TO_SOCKET (fd));
+  /* We don't stop the handshake process for non-fatal errors */
+  do
+    {
+      err = gnutls_reauth (session, 0);
+
+      if (timeout && err == GNUTLS_E_AGAIN)
+        {
+          if (gnutls_record_get_direction (session))
+            {
+              /* wait for writeability */
+              err = select_fd (fd, timeout, WAIT_FOR_WRITE);
+            }
+          else
+            {
+              /* wait for readability */
+              err = select_fd (fd, timeout, WAIT_FOR_READ);
+            }
+
+          if (err <= 0)
+            {
+              if (err == 0)
+                {
+                  errno = ETIMEDOUT;
+                  err = -1;
+                }
+              break;
+            }
+
+           err = GNUTLS_E_AGAIN;
+        }
+      else if (err < 0)
+        {
+          logprintf (LOG_NOTQUIET, "GnuTLS: %s\n", gnutls_strerror (err));
+        }
+    }
+  while (err && gnutls_error_is_fatal (err) == 0);
+
+  if (timeout)
+    {
+#ifdef F_GETFL
+      if (fcntl (fd, F_SETFL, flags) < 0)
+        return -1;
 #else
-  gnutls_transport_set_ptr (session, (gnutls_transport_ptr_t) FD_TO_SOCKET (fd));
+      const int zero = 0;
+      if (ioctl (fd, FIONBIO, &zero) < 0)
+        return -1;
 #endif
+    }
+
+  return err;
+}
+#endif
+
+static const char *
+_sni_hostname(const char *hostname)
+{
+  size_t len = strlen(hostname);
+
+  char *sni_hostname = xmemdup(hostname, len + 1);
+
+  /* Remove trailing dot(s) to fix #47408.
+   * Regarding RFC 6066 (SNI): The hostname is represented as a byte
+   * string using ASCII encoding without a trailing dot. */
+  while (len && sni_hostname[--len] == '.')
+    sni_hostname[len] = 0;
+
+  return sni_hostname;
+}
+
+static int
+set_prio_default (gnutls_session_t session)
+{
+  int err = -1;
 
 #if HAVE_GNUTLS_PRIORITY_SET_DIRECT
   switch (opt.secure_protocol)
     {
     case secure_protocol_auto:
-      err = gnutls_priority_set_direct (session, "NORMAL:%COMPAT:-VERS-SSL3.0", NULL);
+      err = gnutls_set_default_priority (session);
+      gnutls_session_enable_compatibility_mode(session);
       break;
 
     case secure_protocol_sslv2:
@@ -569,6 +656,15 @@ ssl_connect_wget (int fd, const char *hostname, int *continue_session)
       err = gnutls_priority_set_direct (session, "NORMAL:-VERS-SSL3.0:-VERS-TLS1.0:-VERS-TLS1.1", NULL);
       break;
 
+    case secure_protocol_tlsv1_3:
+#if GNUTLS_VERSION_NUMBER >= 0x030603
+      err = gnutls_priority_set_direct (session, "NORMAL:-VERS-SSL3.0:+VERS-TLS1.3:-VERS-TLS1.0:-VERS-TLS1.1:-VERS-TLS1.2", NULL);
+      break;
+#else
+      logprintf (LOG_NOTQUIET, _("Your GnuTLS version is too old to support TLS 1.3\n"));
+      return -1;
+#endif
+
     case secure_protocol_pfs:
       err = gnutls_priority_set_direct (session, "PFS:-VERS-SSL3.0", NULL);
       if (err != GNUTLS_E_SUCCESS)
@@ -577,7 +673,8 @@ ssl_connect_wget (int fd, const char *hostname, int *continue_session)
       break;
 
     default:
-      logprintf (LOG_NOTQUIET, _("GnuTLS: unimplemented 'secure-protocol' option value %d\n"), opt.secure_protocol);
+      logprintf (LOG_NOTQUIET, _("GnuTLS: unimplemented 'secure-protocol' option value %u\n"),
+                 (unsigned) opt.secure_protocol);
       logprintf (LOG_NOTQUIET, _("Please report this issue to bug-wget@gnu.org\n"));
       abort ();
     }
@@ -586,6 +683,7 @@ ssl_connect_wget (int fd, const char *hostname, int *continue_session)
   switch (opt.secure_protocol)
     {
     case secure_protocol_auto:
+      err = gnutls_set_default_priority (session);
       break;
 
     case secure_protocol_sslv2:
@@ -598,19 +696,38 @@ ssl_connect_wget (int fd, const char *hostname, int *continue_session)
       allowed_protocols[0] = GNUTLS_TLS1_0;
       allowed_protocols[1] = GNUTLS_TLS1_1;
       allowed_protocols[2] = GNUTLS_TLS1_2;
+#if GNUTLS_VERSION_NUMBER >= 0x030603
+      allowed_protocols[3] = GNUTLS_TLS1_3;
+#endif
       err = gnutls_protocol_set_priority (session, allowed_protocols);
       break;
 
     case secure_protocol_tlsv1_1:
       allowed_protocols[0] = GNUTLS_TLS1_1;
       allowed_protocols[1] = GNUTLS_TLS1_2;
+#if GNUTLS_VERSION_NUMBER >= 0x030603
+      allowed_protocols[2] = GNUTLS_TLS1_3;
+#endif
       err = gnutls_protocol_set_priority (session, allowed_protocols);
       break;
 
     case secure_protocol_tlsv1_2:
       allowed_protocols[0] = GNUTLS_TLS1_2;
+#if GNUTLS_VERSION_NUMBER >= 0x030603
+      allowed_protocols[1] = GNUTLS_TLS1_3;
+#endif
       err = gnutls_protocol_set_priority (session, allowed_protocols);
       break;
+
+    case secure_protocol_tlsv1_3:
+#if GNUTLS_VERSION_NUMBER >= 0x030603
+      allowed_protocols[0] = GNUTLS_TLS1_3;
+      err = gnutls_protocol_set_priority (session, allowed_protocols);
+      break;
+#else
+      logprintf (LOG_NOTQUIET, _("Your GnuTLS version is too old to support TLS 1.3\n"));
+      return -1;
+#endif
 
     default:
       logprintf (LOG_NOTQUIET, _("GnuTLS: unimplemented 'secure-protocol' option value %d\n"), opt.secure_protocol);
@@ -618,6 +735,58 @@ ssl_connect_wget (int fd, const char *hostname, int *continue_session)
       abort ();
     }
 #endif
+
+  return err;
+}
+
+bool
+ssl_connect_wget (int fd, const char *hostname, int *continue_session)
+{
+  struct wgnutls_transport_context *ctx;
+  gnutls_session_t session;
+  int err;
+
+#if GNUTLS_VERSION_NUMBER >= 0x030604
+  // enable support of TLS1.3 post-handshake authentication
+  gnutls_init (&session, GNUTLS_CLIENT | GNUTLS_POST_HANDSHAKE_AUTH);
+#else
+  gnutls_init (&session, GNUTLS_CLIENT);
+#endif
+
+  /* We set the server name but only if it's not an IP address. */
+  if (! is_valid_ip_address (hostname))
+    {
+      /* GnuTLS 3.4.x (x<=10) disrespects the length parameter, we have to construct a new string */
+      /* see https://gitlab.com/gnutls/gnutls/issues/78 */
+      const char *sni_hostname = _sni_hostname(hostname);
+
+      gnutls_server_name_set (session, GNUTLS_NAME_DNS, sni_hostname, strlen(sni_hostname));
+      xfree(sni_hostname);
+    }
+
+  gnutls_credentials_set (session, GNUTLS_CRD_CERTIFICATE, credentials);
+#ifndef FD_TO_SOCKET
+# define FD_TO_SOCKET(X) (X)
+#endif
+#ifdef HAVE_INTPTR_T
+  gnutls_transport_set_ptr (session, (gnutls_transport_ptr_t) (intptr_t) FD_TO_SOCKET (fd));
+#else
+  gnutls_transport_set_ptr (session, (gnutls_transport_ptr_t) FD_TO_SOCKET (fd));
+#endif
+
+  if (!opt.tls_ciphers_string)
+    {
+      err = set_prio_default (session);
+    }
+  else
+    {
+#if HAVE_GNUTLS_PRIORITY_SET_DIRECT
+      err = gnutls_priority_set_direct (session, opt.tls_ciphers_string, NULL);
+#else
+      logprintf (LOG_NOTQUIET, _("GnuTLS: Cannot set prio string directly. Falling back to default priority.\n"));
+      err = gnutls_set_default_priority ();
+#endif
+    }
 
   if (err < 0)
     {
@@ -671,6 +840,59 @@ ssl_connect_wget (int fd, const char *hostname, int *continue_session)
   return true;
 }
 
+static bool
+pkp_pin_peer_pubkey (gnutls_x509_crt_t cert, const char *pinnedpubkey)
+{
+  /* Scratch */
+  size_t len1 = 0, len2 = 0;
+  char *buff1 = NULL;
+
+  gnutls_pubkey_t key = NULL;
+
+  /* Result is returned to caller */
+  int ret = 0;
+  bool result = false;
+
+  /* if a path wasn't specified, don't pin */
+  if (NULL == pinnedpubkey)
+    return true;
+
+  if (NULL == cert)
+    return result;
+
+  /* Begin Gyrations to get the public key     */
+  gnutls_pubkey_init (&key);
+
+  ret = gnutls_pubkey_import_x509 (key, cert, 0);
+  if (ret < 0)
+    goto cleanup; /* failed */
+
+  ret = gnutls_pubkey_export (key, GNUTLS_X509_FMT_DER, NULL, &len1);
+  if (ret != GNUTLS_E_SHORT_MEMORY_BUFFER || len1 == 0)
+    goto cleanup; /* failed */
+
+  buff1 = xmalloc (len1);
+
+  len2 = len1;
+
+  ret = gnutls_pubkey_export (key, GNUTLS_X509_FMT_DER, buff1, &len2);
+  if (ret < 0 || len1 != len2)
+    goto cleanup; /* failed */
+
+  /* End Gyrations */
+
+  /* The one good exit point */
+  result = wg_pin_peer_pubkey (pinnedpubkey, buff1, len1);
+
+ cleanup:
+  if (NULL != key)
+    gnutls_pubkey_deinit (key);
+
+  xfree (buff1);
+
+  return result;
+}
+
 #define _CHECK_CERT(flag,msg) \
   if (status & (flag))\
     {\
@@ -691,9 +913,10 @@ ssl_check_certificate (int fd, const char *host)
      him about problems with the server's certificate.  */
   const char *severity = opt.check_cert ? _("ERROR") : _("WARNING");
   bool success = true;
+  bool pinsuccess = opt.pinnedpubkey == NULL;
 
   /* The user explicitly said to not check for the certificate.  */
-  if (opt.check_cert == CHECK_CERT_QUIET)
+  if (opt.check_cert == CHECK_CERT_QUIET && pinsuccess)
     return success;
 
   err = gnutls_certificate_verify_peers2 (ctx->session, &status);
@@ -706,7 +929,7 @@ ssl_check_certificate (int fd, const char *host)
     }
 
   _CHECK_CERT (GNUTLS_CERT_INVALID, _("%s: The certificate of %s is not trusted.\n"));
-  _CHECK_CERT (GNUTLS_CERT_SIGNER_NOT_FOUND, _("%s: The certificate of %s hasn't got a known issuer.\n"));
+  _CHECK_CERT (GNUTLS_CERT_SIGNER_NOT_FOUND, _("%s: The certificate of %s doesn't have a known issuer.\n"));
   _CHECK_CERT (GNUTLS_CERT_REVOKED, _("%s: The certificate of %s has been revoked.\n"));
   _CHECK_CERT (GNUTLS_CERT_SIGNER_NOT_CA, _("%s: The certificate signer of %s was not a CA.\n"));
   _CHECK_CERT (GNUTLS_CERT_INSECURE_ALGORITHM, _("%s: The certificate of %s was signed using an insecure algorithm.\n"));
@@ -719,6 +942,7 @@ ssl_check_certificate (int fd, const char *host)
       gnutls_x509_crt_t cert;
       const gnutls_datum_t *cert_list;
       unsigned int cert_list_size;
+      const char *sni_hostname;
 
       if ((err = gnutls_x509_crt_init (&cert)) < 0)
         {
@@ -753,13 +977,23 @@ ssl_check_certificate (int fd, const char *host)
           logprintf (LOG_NOTQUIET, _("The certificate has expired\n"));
           success = false;
         }
-      if (!gnutls_x509_crt_check_hostname (cert, host))
+      sni_hostname = _sni_hostname(host);
+      if (!gnutls_x509_crt_check_hostname (cert, sni_hostname))
         {
           logprintf (LOG_NOTQUIET,
                      _("The certificate's owner does not match hostname %s\n"),
-                     quote (host));
+                     quote (sni_hostname));
           success = false;
         }
+      xfree(sni_hostname);
+
+      pinsuccess = pkp_pin_peer_pubkey (cert, opt.pinnedpubkey);
+      if (!pinsuccess)
+        {
+          logprintf (LOG_ALWAYS, _("The public key does not match pinned public key!\n"));
+          success = false;
+        }
+
  crt_deinit:
       gnutls_x509_crt_deinit (cert);
     }
@@ -770,5 +1004,6 @@ ssl_check_certificate (int fd, const char *host)
     }
 
  out:
-  return opt.check_cert == CHECK_CERT_ON ? success : true;
+  /* never return true if pinsuccess fails */
+  return !pinsuccess ? false : (opt.check_cert == CHECK_CERT_ON ? success : true);
 }

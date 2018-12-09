@@ -93,3 +93,4 @@ util/Makefile.in
 # others
 /tags
 /cscope.out
+/.vs

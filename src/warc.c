@@ -1,5 +1,5 @@
 /* Utility functions for writing WARC files.
-   Copyright (C) 2011, 2012, 2015 Free Software Foundation, Inc.
+   Copyright (C) 2011-2012, 2015, 2018 Free Software Foundation, Inc.
 
 This file is part of GNU Wget.
 
@@ -32,6 +32,7 @@ as that of the covered work.  */
 #include "utils.h"
 #include "version.h"
 #include "dirname.h"
+#include "url.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -202,6 +203,7 @@ warc_write_start_record (void)
   /* Start a GZIP stream, if required. */
   if (opt.warc_compression_enabled)
     {
+      int dup_fd;
       /* Record the starting offset of the new record. */
       warc_current_gzfile_offset = ftello (warc_current_file);
 
@@ -213,13 +215,23 @@ warc_write_start_record (void)
       fflush (warc_current_file);
 
       /* Start a new GZIP stream. */
-      warc_current_gzfile = gzdopen (dup (fileno (warc_current_file)), "wb9");
+      dup_fd = dup (fileno (warc_current_file));
+      if (dup_fd < 0)
+        {
+          logprintf (LOG_NOTQUIET,
+_("Error duplicating WARC file file descriptor.\n"));
+          warc_write_ok = false;
+          return false;
+        }
+
+      warc_current_gzfile = gzdopen (dup_fd, "wb9");
       warc_current_gzfile_uncompressed_size = 0;
 
       if (warc_current_gzfile == NULL)
         {
           logprintf (LOG_NOTQUIET,
 _("Error opening GZIP stream to WARC file.\n"));
+          close (dup_fd);
           warc_write_ok = false;
           return false;
         }
@@ -242,6 +254,22 @@ warc_write_header (const char *name, const char *value)
       warc_write_string (": ");
       warc_write_string (value);
       warc_write_string ("\r\n");
+    }
+  return warc_write_ok;
+}
+
+/* Writes a WARC header with a URI as value to the current WARC record.
+   This method may be run after warc_write_start_record and
+   before warc_write_block_from_file.  */
+static bool
+warc_write_header_uri (const char *name, const char *value)
+{
+  if (value)
+    {
+      warc_write_string (name);
+      warc_write_string (": <");
+      warc_write_string (value);
+      warc_write_string (">\r\n");
     }
   return warc_write_ok;
 }
@@ -1223,9 +1251,15 @@ warc_close (void)
       warc_write_metadata ();
       *warc_current_warcinfo_uuid_str = 0;
       fclose (warc_current_file);
+      warc_current_file = NULL;
     }
+
   if (warc_current_cdx_file != NULL)
-    fclose (warc_current_cdx_file);
+    {
+      fclose (warc_current_cdx_file);
+      warc_current_cdx_file = NULL;
+    }
+
   if (warc_log_fp != NULL)
     {
       fclose (warc_log_fp);
@@ -1292,7 +1326,7 @@ warc_write_request_record (const char *url, const char *timestamp_str,
 {
   warc_write_start_record ();
   warc_write_header ("WARC-Type", "request");
-  warc_write_header ("WARC-Target-URI", url);
+  warc_write_header_uri ("WARC-Target-URI", url);
   warc_write_header ("Content-Type", "application/http;msgtype=request");
   warc_write_date_header (timestamp_str);
   warc_write_header ("WARC-Record-ID", record_uuid);
@@ -1330,6 +1364,7 @@ warc_write_cdx_record (const char *url, const char *timestamp_str,
   char timestamp_str_cdx[15];
   char offset_string[MAX_INT_TO_STRING_LEN(off_t)];
   const char *checksum;
+  char *tmp_location = NULL;
 
   memcpy (timestamp_str_cdx     , timestamp_str     , 4); /* "YYYY" "-" */
   memcpy (timestamp_str_cdx +  4, timestamp_str +  5, 2); /* "mm"   "-" */
@@ -1348,16 +1383,19 @@ warc_write_cdx_record (const char *url, const char *timestamp_str,
   if (mime_type == NULL || strlen(mime_type) == 0)
     mime_type = "-";
   if (redirect_location == NULL || strlen(redirect_location) == 0)
-    redirect_location = "-";
+    tmp_location = strdup ("-");
+  else
+    tmp_location = url_escape(redirect_location);
 
   number_to_string (offset_string, offset);
 
   /* Print the CDX line. */
   fprintf (warc_current_cdx_file, "%s %s %s %s %d %s %s - %s %s %s\n", url,
            timestamp_str_cdx, url, mime_type, response_code, checksum,
-           redirect_location, offset_string, warc_current_filename,
+           tmp_location, offset_string, warc_current_filename,
            response_uuid);
   fflush (warc_current_cdx_file);
+  free (tmp_location);
 
   return true;
 }
@@ -1397,7 +1435,7 @@ warc_write_revisit_record (const char *url, const char *timestamp_str,
   warc_write_header ("WARC-Refers-To", refers_to);
   warc_write_header ("WARC-Profile", "http://netpreserve.org/warc/1.0/revisit/identical-payload-digest");
   warc_write_header ("WARC-Truncated", "length");
-  warc_write_header ("WARC-Target-URI", url);
+  warc_write_header_uri ("WARC-Target-URI", url);
   warc_write_date_header (timestamp_str);
   warc_write_ip_header (ip);
   warc_write_header ("Content-Type", "application/http;msgtype=response");
@@ -1489,7 +1527,7 @@ warc_write_response_record (const char *url, const char *timestamp_str,
   warc_write_header ("WARC-Record-ID", response_uuid);
   warc_write_header ("WARC-Warcinfo-ID", warc_current_warcinfo_uuid_str);
   warc_write_header ("WARC-Concurrent-To", concurrent_to_uuid);
-  warc_write_header ("WARC-Target-URI", url);
+  warc_write_header_uri ("WARC-Target-URI", url);
   warc_write_date_header (timestamp_str);
   warc_write_ip_header (ip);
   warc_write_header ("WARC-Block-Digest", block_digest);
@@ -1546,7 +1584,7 @@ warc_write_record (const char *record_type, const char *resource_uuid,
   warc_write_header ("WARC-Record-ID", resource_uuid);
   warc_write_header ("WARC-Warcinfo-ID", warc_current_warcinfo_uuid_str);
   warc_write_header ("WARC-Concurrent-To", concurrent_to_uuid);
-  warc_write_header ("WARC-Target-URI", url);
+  warc_write_header_uri ("WARC-Target-URI", url);
   warc_write_date_header (timestamp_str);
   warc_write_ip_header (ip);
   warc_write_digest_headers (body, payload_offset);

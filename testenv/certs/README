@@ -30,11 +30,11 @@ Enter a dnsName of the subject of the certificate:
 Enter a URI of the subject of the certificate:
 Enter the IP address of the subject of the certificate:
 Enter the e-mail of the subject of the certificate:
+Will the certificate be used to sign OCSP requests? (y/N):
+Will the certificate be used to sign code? (y/N):
+Will the certificate be used for time stamping? (y/N):
 Will the certificate be used to sign other certificates? (y/N): y
 Will the certificate be used to sign CRLs? (y/N): y
-Will the certificate be used to sign code? (y/N):
-Will the certificate be used to sign OCSP requests? (y/N): y
-Will the certificate be used for time stamping? (y/N):
 Enter the URI of the CRL distribution point:
 
 
@@ -75,3 +75,13 @@ Generating a signed CRL...
 Update times.
 The certificate will expire in (days): -1
 CRL Number (default: 6080006793650397145):
+
+To generate a public key in PEM format:
+$ openssl x509 -noout -pubkey < server-cert.pem > server-pubkey.pem
+
+To generate a public key in DER format:
+$ openssl x509 -noout -pubkey < server-cert.pem | openssl asn1parse -noout -inform pem -out server-pubkey.der
+
+To generate a sha256 hash of the public key:
+$ openssl x509 -noout -pubkey < server-cert.pem | openssl asn1parse -noout -inform pem -out /dev/stdout | openssl dgst -sha256 -binary | openssl base64
+mHiEhWHvusnzP7COZk+SzSJ+Gl7nZT+ADx0PUnDD7mM=

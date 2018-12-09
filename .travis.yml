@@ -1,4 +1,5 @@
 sudo: no
+dist: trusty
 
 language: c
 
@@ -36,7 +37,7 @@ addons:
             - make
             - libhttp-daemon-perl
             - libio-socket-ssl-perl
-            - libidn11-dev
+            - libidn2-dev
             - gettext
             - texlive
             - python3

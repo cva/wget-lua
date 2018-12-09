@@ -1,7 +1,5 @@
 /* struct options.
-   Copyright (C) 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004,
-   2005, 2006, 2007, 2008, 2009, 2010, 2011, 2015 Free Software
-   Foundation, Inc.
+   Copyright (C) 1996-2011, 2015, 2018 Free Software Foundation, Inc.
 
 This file is part of GNU Wget.
 
@@ -43,6 +41,8 @@ struct options
   bool quiet;                   /* Are we quiet? */
   int ntry;                     /* Number of tries per URL */
   bool retry_connrefused;       /* Treat CONNREFUSED as non-fatal. */
+  bool retry_on_host_error;     /* Treat host errors as non-fatal. */
+  char *retry_on_http_error;    /* Treat given HTTP errors as non-fatal. */
   bool background;              /* Whether we should work in background. */
   bool ignore_length;           /* Do we heed content-length at all?  */
   bool recursive;               /* Are we recursive? */
@@ -61,12 +61,13 @@ struct options
   bool add_hostdir;             /* Do we add hostname directory? */
   bool protocol_directories;    /* Whether to prepend "http"/"ftp" to dirs. */
   bool noclobber;               /* Disables clobbering of existing data. */
-  bool unlink;                  /* remove file before clobbering */
+  bool unlink_requested;        /* remove file before clobbering */
   char *dir_prefix;             /* The top of directory tree */
   char *lfilename;              /* Log filename */
   char *input_filename;         /* Input filename */
 #ifdef HAVE_METALINK
   char *input_metalink;         /* Input metalink file */
+  int metalink_index;           /* Metalink application/metalink4+xml metaurl ordinal number. */
   bool metalink_over_http;      /* Use Metalink if present in HTTP response */
   char *preferred_location;     /* Preferred location for Metalink resources */
 #endif
@@ -91,13 +92,18 @@ struct options
   void *acceptregex;            /* Patterns to accept (a regex struct). */
   void *rejectregex;            /* Patterns to reject (a regex struct). */
   enum {
-#ifdef HAVE_LIBPCRE
+#if defined HAVE_LIBPCRE || HAVE_LIBPCRE2
     regex_type_pcre,
 #endif
     regex_type_posix
   } regex_type;                 /* The regex library. */
   void *(*regex_compile_fun)(const char *);             /* Function to compile a regex. */
   bool (*regex_match_fun)(const void *, const char *);  /* Function to match a string to a regex. */
+
+#ifdef HAVE_LIBCARES
+  char *bind_dns_address;
+  char *dns_servers;
+#endif
 
   char **domains;               /* See host.c */
   char **exclude_domains;
@@ -125,9 +131,12 @@ struct options
   bool warc_keep_log;           /* Store the log file in a WARC record. */
   char **warc_user_headers;     /* User-defined WARC header(s). */
 
+  bool enable_xattr;            /* Store metadata in POSIX extended attributes. */
+
   char *user;                   /* Generic username */
   char *passwd;                 /* Generic password */
   bool ask_passwd;              /* Ask for password? */
+  char *use_askpass;           /* value to use for use-askpass if WGET_ASKPASS is not set */
 
   bool always_rest;             /* Always use REST. */
   wgint start_pos;              /* Start position of a download. */
@@ -223,6 +232,7 @@ struct options
     secure_protocol_tlsv1,
     secure_protocol_tlsv1_1,
     secure_protocol_tlsv1_2,
+    secure_protocol_tlsv1_3,
     secure_protocol_pfs
   } secure_protocol;            /* type of secure protocol to use. */
   int check_cert;               /* whether to validate the server's cert */
@@ -239,6 +249,11 @@ struct options
   char *ca_cert;                /* CA certificate file to use */
   char *crl_file;               /* file with CRLs */
 
+  char *pinnedpubkey;           /* Public key (PEM/DER) file, or any number
+                                   of base64 encoded sha256 hashes preceded by
+                                   \'sha256//\' and separated by \';\', to verify
+                                   peer against */
+
   char *random_file;            /* file with random data to seed the PRNG */
   char *egd_file;               /* file name of the egd daemon socket */
   bool https_only;              /* whether to follow HTTPS only */
@@ -246,11 +261,14 @@ struct options
   bool ftps_fallback_to_ftp;
   bool ftps_implicit;
   bool ftps_clear_data_connection;
+
+  char *tls_ciphers_string;
 #endif /* HAVE_SSL */
 
   bool cookies;                 /* whether cookies are used. */
   char *cookies_input;          /* file we're loading the cookies from. */
   char *cookies_output;         /* file we're saving the cookies to. */
+  bool keep_badhash;            /* Keep files with checksum mismatch. */
   bool keep_session_cookies;    /* whether session cookies should be
                                    saved and loaded. */
 
@@ -299,7 +317,7 @@ struct options
 
   bool enable_iri;
   char *encoding_remote;
-  char *locale;
+  const char *locale;
 
   bool trustservernames;
 #ifdef __VMS
@@ -318,12 +336,23 @@ struct options
 
   bool report_bps;              /*Output bandwidth in bits format*/
 
+#ifdef HAVE_LIBZ
+  enum compression_options {
+    compression_auto,
+    compression_gzip,
+    compression_none
+  } compression;                /* type of HTTP compression to use */
+#endif
+
   char *rejected_log;           /* The file to log rejected URLS to. */
 
 #ifdef HAVE_HSTS
   bool hsts;
   char *hsts_file;
 #endif
+
+  const char *homedir;          /* the homedir of the running process */
+  const char *wgetrcfile;       /* the wgetrc file to be loaded */
 };
 
 extern struct options opt;

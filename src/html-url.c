@@ -1,7 +1,5 @@
 /* Collect URLs from HTML source.
-   Copyright (C) 1998, 1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006,
-   2007, 2008, 2009, 2010, 2011, 2012, 2015 Free Software Foundation,
-   Inc.
+   Copyright (C) 1998-2012, 2015, 2018 Free Software Foundation, Inc.
 
 This file is part of GNU Wget.
 
@@ -56,6 +54,7 @@ typedef void (*tag_handler_t) (int, struct taginfo *, struct map_context *);
 DECLARE_TAG_HANDLER (tag_find_urls);
 DECLARE_TAG_HANDLER (tag_handle_base);
 DECLARE_TAG_HANDLER (tag_handle_form);
+DECLARE_TAG_HANDLER (tag_handle_img);
 DECLARE_TAG_HANDLER (tag_handle_link);
 DECLARE_TAG_HANDLER (tag_handle_meta);
 
@@ -105,7 +104,7 @@ static struct known_tag {
   { TAG_FORM,    "form",        tag_handle_form },
   { TAG_FRAME,   "frame",       tag_find_urls },
   { TAG_IFRAME,  "iframe",      tag_find_urls },
-  { TAG_IMG,     "img",         tag_find_urls },
+  { TAG_IMG,     "img",         tag_handle_img },
   { TAG_INPUT,   "input",       tag_find_urls },
   { TAG_LAYER,   "layer",       tag_find_urls },
   { TAG_LINK,    "link",        tag_handle_link },
@@ -183,7 +182,8 @@ static const char *additional_attributes[] = {
   "name",                       /* used by tag_handle_meta  */
   "content",                    /* used by tag_handle_meta  */
   "action",                     /* used by tag_handle_form  */
-  "style"                       /* used by check_style_attr */
+  "style",                      /* used by check_style_attr */
+  "srcset",                     /* used by tag_handle_img */
 };
 
 static struct hash_table *interesting_tags;
@@ -674,6 +674,91 @@ tag_handle_meta (int tagid _GL_UNUSED, struct taginfo *tag, struct map_context *
     }
 }
 
+/* Handle the IMG tag.  This requires special handling for the srcset attr,
+   while the traditional src/lowsrc/href attributes can be handled generically.
+*/
+
+static void
+tag_handle_img (int tagid, struct taginfo *tag, struct map_context *ctx) {
+  int attrind;
+  char *srcset;
+
+  /* Use the generic approach for the attributes without special syntax. */
+  tag_find_urls(tagid, tag, ctx);
+
+  srcset = find_attr (tag, "srcset", &attrind);
+  if (srcset)
+    {
+      /* These are relative to the input text. */
+      int base_ind = ATTR_POS (tag,attrind,ctx);
+      int size = strlen (srcset);
+
+      /* These are relative to srcset. */
+      int offset, url_start, url_end;
+
+      /* Make sure to line up base_ind with srcset[0], not outside quotes. */
+      if (ctx->text[base_ind] == '"' || ctx->text[base_ind] == '\'')
+        ++base_ind;
+
+      offset = 0;
+      while (offset < size)
+        {
+          bool has_descriptor = true;
+
+          /* Skip over initial whitespace and commas. Note there is no \v
+            in HTML5 whitespace. */
+          url_start = offset + strspn (srcset + offset, " \f\n\r\t,");
+
+          if (url_start == size)
+            return;
+
+          /* URL is any non-whitespace chars (including commas) - but with
+             trailing commas removed. */
+          url_end = url_start + strcspn (srcset + url_start, " \f\n\r\t");
+          while ((url_end - 1) > url_start && srcset[url_end - 1] == ',')
+            {
+              has_descriptor = false;
+              --url_end;
+            }
+
+          if (url_end > url_start)
+            {
+              char *url_text = strdupdelim (srcset + url_start,
+                                            srcset + url_end);
+              struct urlpos *up = append_url (url_text, base_ind + url_start,
+                                              url_end - url_start, ctx);
+              if (up)
+                {
+                  up->link_inline_p = 1;
+                  up->link_noquote_html_p = 1;
+                }
+              xfree (url_text);
+            }
+
+          /* If the URL wasn't terminated by a , there may also be a descriptor
+             which we just skip. */
+          if (has_descriptor)
+            {
+              /* This is comma-terminated, except there may be one level of
+                 parentheses escaping that. */
+              bool in_paren = false;
+              for (offset = url_end; offset < size; ++offset)
+                {
+                  char c = srcset[offset];
+                  if (c == '(')
+                    in_paren = true;
+                  else if (c == ')' && in_paren)
+                    in_paren = false;
+                  else if (c == ',' && !in_paren)
+                    break;
+                }
+            }
+          else
+            offset = url_end;
+        }
+    }
+}
+
 /* Dispatch the tag handler appropriate for the tag we're mapping
    over.  See known_tags[] for definition of tag handlers.  */
 
@@ -711,21 +796,12 @@ collect_tags_mapper (struct taginfo *tag, void *arg)
    <base href=...> and does the right thing.  */
 
 struct urlpos *
-get_urls_html (const char *file, const char *url, bool *meta_disallow_follow,
-               struct iri *iri)
+get_urls_html_fm (const char *file, const struct file_memory *fm,
+                    const char *url, bool *meta_disallow_follow,
+                    struct iri *iri)
 {
-  struct file_memory *fm;
   struct map_context ctx;
   int flags;
-
-  /* Load the file. */
-  fm = wget_read_file (file);
-  if (!fm)
-    {
-      logprintf (LOG_NOTQUIET, "%s: %s\n", file, strerror (errno));
-      return NULL;
-    }
-  DEBUGP (("Loaded %s (size %s).\n", file, number_to_static_string (fm->length)));
 
   ctx.text = fm->content;
   ctx.head = NULL;
@@ -752,18 +828,40 @@ get_urls_html (const char *file, const char *url, bool *meta_disallow_follow,
   map_html_tags (fm->content, fm->length, collect_tags_mapper, &ctx, flags,
                  NULL, interesting_attributes);
 
+#ifdef ENABLE_IRI
   /* Meta charset is only valid if there was no HTTP header Content-Type charset. */
   /* This is true for HTTP 1.0 and 1.1. */
   if (iri && !iri->content_encoding && meta_charset)
     set_content_encoding (iri, meta_charset);
+#endif
+  xfree (meta_charset);
 
   DEBUGP (("no-follow in %s: %d\n", file, ctx.nofollow));
   if (meta_disallow_follow)
     *meta_disallow_follow = ctx.nofollow;
 
   xfree (ctx.base);
-  wget_read_file_free (fm);
   return ctx.head;
+}
+
+struct urlpos *
+get_urls_html (const char *file, const char *url, bool *meta_disallow_follow,
+                 struct iri *iri)
+{
+  struct urlpos *urls;
+  struct file_memory *fm;
+
+  fm = wget_read_file (file);
+  if (!fm)
+    {
+      logprintf (LOG_NOTQUIET, "%s: %s\n", file, strerror (errno));
+      return NULL;
+    }
+  DEBUGP (("Loaded %s (size %s).\n", file, number_to_static_string (fm->length)));
+
+  urls = get_urls_html_fm (file, fm, url, meta_disallow_follow, iri);
+  wget_read_file_free (fm);
+  return urls;
 }
 
 /* This doesn't really have anything to do with HTML, but it's similar

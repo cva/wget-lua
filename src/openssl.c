@@ -1,6 +1,5 @@
 /* SSL support via OpenSSL library.
-   Copyright (C) 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008,
-   2009, 2010, 2011, 2012, 2015 Free Software Foundation, Inc.
+   Copyright (C) 2000-2012, 2015, 2018 Free Software Foundation, Inc.
    Originally contributed by Christian Fraenkel.
 
 This file is part of GNU Wget.
@@ -35,6 +34,7 @@ as that of the covered work.  */
 #include <errno.h>
 #include <unistd.h>
 #include <string.h>
+#include <xalloc.h>
 
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -43,7 +43,9 @@ as that of the covered work.  */
 #include <openssl/bio.h>
 #if OPENSSL_VERSION_NUMBER >= 0x00907000
 #include <openssl/conf.h>
+#ifndef OPENSSL_NO_ENGINE
 #include <openssl/engine.h>
+#endif
 #endif
 
 #include "utils.h"
@@ -67,10 +69,6 @@ init_prng (void)
   char namebuf[256];
   const char *random_file;
 
-  if (RAND_status ())
-    /* The PRNG has been seeded; no further action is necessary. */
-    return;
-
   /* Seed from a file specified by the user.  This will be the file
      specified with --random-file, $RANDFILE, if set, or ~/.rnd, if it
      exists.  */
@@ -88,17 +86,11 @@ init_prng (void)
        curl) from random file. */
     RAND_load_file (random_file, 16384);
 
-  if (RAND_status ())
-    return;
-
 #ifdef HAVE_RAND_EGD
   /* Get random data from EGD if opt.egd_file was used.  */
   if (opt.egd_file && *opt.egd_file)
     RAND_egd (opt.egd_file);
 #endif
-
-  if (RAND_status ())
-    return;
 
 #ifdef WINDOWS
   /* Under Windows, we can try to seed the PRNG using screen content.
@@ -173,11 +165,17 @@ ssl_init (void)
 {
   SSL_METHOD const *meth;
   long ssl_options = 0;
+  char *ciphers_string = NULL;
+#if !defined(LIBRESSL_VERSION_NUMBER) && (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+  int ssl_proto_version = 0;
+#endif
 
 #if OPENSSL_VERSION_NUMBER >= 0x00907000
   if (ssl_true_initialized == 0)
     {
+#if OPENSSL_API_COMPAT < 0x10100000L
       OPENSSL_config (NULL);
+#endif
       ssl_true_initialized = 1;
     }
 #endif
@@ -197,24 +195,32 @@ ssl_init (void)
 
 #if OPENSSL_VERSION_NUMBER >= 0x00907000
   OPENSSL_load_builtin_modules();
+#ifndef OPENSSL_NO_ENGINE
   ENGINE_load_builtin_engines();
+#endif
   CONF_modules_load_file(NULL, NULL,
       CONF_MFLAGS_DEFAULT_SECTION|CONF_MFLAGS_IGNORE_MISSING_FILE);
 #endif
+#if OPENSSL_API_COMPAT >= 0x10100000L
+  OPENSSL_init_ssl(0, NULL);
+#else
   SSL_library_init ();
   SSL_load_error_strings ();
+#endif
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   SSLeay_add_all_algorithms ();
   SSLeay_add_ssl_algorithms ();
+#endif
 
   switch (opt.secure_protocol)
     {
-#ifndef OPENSSL_NO_SSL2
+#if !defined OPENSSL_NO_SSL2 && OPENSSL_VERSION_NUMBER < 0x10100000L
     case secure_protocol_sslv2:
       meth = SSLv2_client_method ();
       break;
 #endif
 
-#ifndef OPENSSL_NO_SSL3
+#ifndef OPENSSL_NO_SSL3_METHOD
     case secure_protocol_sslv3:
       meth = SSLv3_client_method ();
       break;
@@ -226,16 +232,41 @@ ssl_init (void)
       ssl_options |= SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
       break;
     case secure_protocol_tlsv1:
+#if !defined(LIBRESSL_VERSION_NUMBER) && (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+      meth = TLS_client_method();
+      ssl_proto_version = TLS1_VERSION;
+#else
       meth = TLSv1_client_method ();
+#endif
       break;
 
 #if OPENSSL_VERSION_NUMBER >= 0x10001000
     case secure_protocol_tlsv1_1:
+#if !defined(LIBRESSL_VERSION_NUMBER) && (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+      meth = TLS_client_method();
+      ssl_proto_version = TLS1_1_VERSION;
+#else
       meth = TLSv1_1_client_method ();
+#endif
       break;
 
     case secure_protocol_tlsv1_2:
+#if !defined(LIBRESSL_VERSION_NUMBER) && (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+      meth = TLS_client_method();
+      ssl_proto_version = TLS1_2_VERSION;
+#else
       meth = TLSv1_2_client_method ();
+#endif
+      break;
+
+    case secure_protocol_tlsv1_3:
+#if !defined(LIBRESSL_VERSION_NUMBER) && (OPENSSL_VERSION_NUMBER >= 0x10100000L) && defined TLS1_3_VERSION
+      meth = TLS_client_method();
+      ssl_proto_version = TLS1_3_VERSION;
+#else
+      logprintf (LOG_NOTQUIET, _("Your OpenSSL version is too old to support TLS 1.3\n"));
+      goto error;
+#endif
       break;
 #else
     case secure_protocol_tlsv1_1:
@@ -245,6 +276,7 @@ ssl_init (void)
     case secure_protocol_tlsv1_2:
       logprintf (LOG_NOTQUIET, _("Your OpenSSL version is too old to support TLSv1.2\n"));
       goto error;
+
 #endif
 
     default:
@@ -262,11 +294,35 @@ ssl_init (void)
   if (ssl_options)
     SSL_CTX_set_options (ssl_ctx, ssl_options);
 
+#if !defined(LIBRESSL_VERSION_NUMBER) && (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+  if (ssl_proto_version)
+    SSL_CTX_set_min_proto_version(ssl_ctx, ssl_proto_version);
+#endif
+
   /* OpenSSL ciphers: https://www.openssl.org/docs/apps/ciphers.html
-   * Since we want a good protection, we also use HIGH (that excludes MD4 ciphers and some more)
+   *
+   * Rules:
+   *  1. --ciphers overrides everything
+   *  2. We allow RSA key exchange by default (secure_protocol_auto)
+   *  3. We disallow RSA key exchange if PFS was requested (secure_protocol_pfs)
    */
-  if (opt.secure_protocol == secure_protocol_pfs)
-    SSL_CTX_set_cipher_list (ssl_ctx, "HIGH:MEDIUM:!RC4:!SRP:!PSK:!RSA:!aNULL@STRENGTH");
+  if (!opt.tls_ciphers_string)
+    {
+      if (opt.secure_protocol == secure_protocol_auto)
+	      ciphers_string = "HIGH:!aNULL:!RC4:!MD5:!SRP:!PSK";
+      else if (opt.secure_protocol == secure_protocol_pfs)
+	      ciphers_string = "HIGH:!aNULL:!RC4:!MD5:!SRP:!PSK:!kRSA";
+    }
+  else
+    {
+      ciphers_string = opt.tls_ciphers_string;
+    }
+
+  if (ciphers_string && !SSL_CTX_set_cipher_list(ssl_ctx, ciphers_string))
+    {
+      logprintf(LOG_NOTQUIET, _("OpenSSL: Invalid cipher list: %s\n"), ciphers_string);
+      goto error;
+    }
 
   SSL_CTX_set_default_verify_paths (ssl_ctx);
   SSL_CTX_load_verify_locations (ssl_ctx, opt.ca_cert, opt.ca_directory);
@@ -506,6 +562,22 @@ ssl_connect_with_timeout_callback(void *arg)
   ctx->result = SSL_connect(ctx->ssl);
 }
 
+static const char *
+_sni_hostname(const char *hostname)
+{
+  size_t len = strlen(hostname);
+
+  char *sni_hostname = xmemdup(hostname, len + 1);
+
+  /* Remove trailing dot(s) to fix #47408.
+   * Regarding RFC 6066 (SNI): The hostname is represented as a byte
+   * string using ASCII encoding without a trailing dot. */
+  while (len && sni_hostname[--len] == '.')
+    sni_hostname[len] = 0;
+
+  return sni_hostname;
+}
+
 /* Perform the SSL handshake on file descriptor FD, which is assumed
    to be connected to an SSL server.  The SSL handle provided by
    OpenSSL is registered with the file descriptor FD using
@@ -532,7 +604,12 @@ ssl_connect_wget (int fd, const char *hostname, int *continue_session)
      then use it whenever we have a hostname.  If not, don't, ever. */
   if (! is_valid_ip_address (hostname))
     {
-      if (! SSL_set_tlsext_host_name (conn, hostname))
+      const char *sni_hostname = _sni_hostname(hostname);
+
+      long rc = SSL_set_tlsext_host_name (conn, sni_hostname);
+      xfree(sni_hostname);
+
+      if (rc == 0)
         {
           DEBUGP (("Failed to set TLS server-name indication."));
           goto error;
@@ -555,13 +632,22 @@ ssl_connect_wget (int fd, const char *hostname, int *continue_session)
     goto error;
   SSL_set_connect_state (conn);
 
+  /* Re-seed the PRNG before the SSL handshake */
+  init_prng ();
+  if (RAND_status () != 1)
+    {
+      logprintf(LOG_NOTQUIET,
+		_("WARNING: Could not seed PRNG. Consider using --random-file.\n"));
+      goto error;
+    }
+
   scwt_ctx.ssl = conn;
   if (run_with_timeout(opt.read_timeout, ssl_connect_with_timeout_callback,
                        &scwt_ctx)) {
     DEBUGP (("SSL handshake timed out.\n"));
     goto timeout;
   }
-  if (scwt_ctx.result <= 0 || SSL_state(conn) != SSL_ST_OK)
+  if (scwt_ctx.result <= 0 || !SSL_is_init_finished(conn))
     goto error;
 
   ctx = xnew0 (struct openssl_transport_context);
@@ -650,6 +736,65 @@ static char *_get_rfc2253_formatted (X509_NAME *name)
   return out ? out : xstrdup("");
 }
 
+/*
+ * Heavily modified from:
+ * https://www.owasp.org/index.php/Certificate_and_Public_Key_Pinning#OpenSSL
+ */
+static bool
+pkp_pin_peer_pubkey (X509* cert, const char *pinnedpubkey)
+{
+  /* Scratch */
+  int len1 = 0, len2 = 0;
+  char *buff1 = NULL, *temp = NULL;
+
+  /* Result is returned to caller */
+  bool result = false;
+
+  /* if a path wasn't specified, don't pin */
+  if (!pinnedpubkey)
+    return true;
+
+  if (!cert)
+    return result;
+
+  /* Begin Gyrations to get the subjectPublicKeyInfo     */
+  /* Thanks to Viktor Dukhovni on the OpenSSL mailing list */
+
+  /* https://groups.google.com/group/mailing.openssl.users/browse_thread
+   /thread/d61858dae102c6c7 */
+  len1 = i2d_X509_PUBKEY (X509_get_X509_PUBKEY (cert), NULL);
+  if (len1 < 1)
+    goto cleanup; /* failed */
+
+  /* https://www.openssl.org/docs/crypto/buffer.html */
+  buff1 = temp = OPENSSL_malloc (len1);
+  if (!buff1)
+    goto cleanup; /* failed */
+
+  /* https://www.openssl.org/docs/crypto/d2i_X509.html */
+  len2 = i2d_X509_PUBKEY (X509_get_X509_PUBKEY (cert), (unsigned char **) &temp);
+
+  /*
+   * These checks are verifying we got back the same values as when we
+   * sized the buffer. It's pretty weak since they should always be the
+   * same. But it gives us something to test.
+   */
+  if ((len1 != len2) || !temp || ((temp - buff1) != len1))
+    goto cleanup; /* failed */
+
+  /* End Gyrations */
+
+  /* The one good exit point */
+  result = wg_pin_peer_pubkey (pinnedpubkey, buff1, len1);
+
+ cleanup:
+  /* https://www.openssl.org/docs/crypto/buffer.html */
+  if (NULL != buff1)
+    OPENSSL_free (buff1);
+
+  return result;
+}
+
 /* Verify the validity of the certificate presented by the server.
    Also check that the "common name" of the server, as presented by
    its certificate, corresponds to HOST.  (HOST typically comes from
@@ -673,6 +818,7 @@ ssl_check_certificate (int fd, const char *host)
   long vresult;
   bool success = true;
   bool alt_name_checked = false;
+  bool pinsuccess = opt.pinnedpubkey == NULL;
 
   /* If the user has specified --no-check-cert, we still want to warn
      him about problems with the server's certificate.  */
@@ -683,7 +829,7 @@ ssl_check_certificate (int fd, const char *host)
   assert (conn != NULL);
 
   /* The user explicitly said to not check for the certificate.  */
-  if (opt.check_cert == CHECK_CERT_QUIET)
+  if (opt.check_cert == CHECK_CERT_QUIET && pinsuccess)
     return success;
 
   cert = SSL_get_peer_certificate (conn);
@@ -762,9 +908,12 @@ ssl_check_certificate (int fd, const char *host)
     {
       /* Test subject alternative names */
 
+      /* SNI hostname must not have a trailing dot */
+      const char *sni_hostname = _sni_hostname(host);
+
       /* Do we want to check for dNSNAmes or ipAddresses (see RFC 2818)?
        * Signal it by host_in_octet_string. */
-      ASN1_OCTET_STRING *host_in_octet_string = a2i_IPADDRESS (host);
+      ASN1_OCTET_STRING *host_in_octet_string = a2i_IPADDRESS (sni_hostname);
 
       int numaltnames = sk_GENERAL_NAME_num (subjectAltNames);
       int i;
@@ -799,7 +948,7 @@ ssl_check_certificate (int fd, const char *host)
                   if (0 <= ASN1_STRING_to_UTF8 (&name_in_utf8, name->d.dNSName))
                     {
                       /* Compare and check for NULL attack in ASN1_STRING */
-                      if (pattern_match ((char *)name_in_utf8, host) &&
+                      if (pattern_match ((char *)name_in_utf8, sni_hostname) &&
                             (strlen ((char *)name_in_utf8) ==
                                 (size_t) ASN1_STRING_length (name->d.dNSName)))
                         {
@@ -820,9 +969,11 @@ ssl_check_certificate (int fd, const char *host)
           logprintf (LOG_NOTQUIET,
               _("%s: no certificate subject alternative name matches\n"
                 "\trequested host name %s.\n"),
-                     severity, quote_n (1, host));
+                     severity, quote_n (1, sni_hostname));
           success = false;
         }
+
+      xfree(sni_hostname);
     }
 
   if (alt_name_checked == false)
@@ -877,6 +1028,13 @@ ssl_check_certificate (int fd, const char *host)
         }
     }
 
+    pinsuccess = pkp_pin_peer_pubkey (cert, opt.pinnedpubkey);
+    if (!pinsuccess)
+      {
+        logprintf (LOG_ALWAYS, _("The public key does not match pinned public key!\n"));
+        success = false;
+      }
+
 
   if (success)
     DEBUGP (("X509 certificate successfully verified and matches host %s\n",
@@ -889,7 +1047,8 @@ ssl_check_certificate (int fd, const char *host)
 To connect to %s insecurely, use `--no-check-certificate'.\n"),
                quotearg_style (escape_quoting_style, host));
 
-  return opt.check_cert == CHECK_CERT_ON ? success : true;
+  /* never return true if pinsuccess fails */
+  return !pinsuccess ? false : (opt.check_cert == CHECK_CERT_ON ? success : true);
 }
 
 /*

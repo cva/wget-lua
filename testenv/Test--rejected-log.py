@@ -6,7 +6,6 @@ from misc.wget_file import WgetFile
 """
     This test executed Wget in recursive mode with a rejected log outputted.
 """
-TEST_NAME = "Rejected Log"
 ############# File Definitions ###############################################
 mainpage = """
 <html>
@@ -15,7 +14,7 @@ mainpage = """
 </head>
 <body>
   <p>
-    Recurse to a <a href="http://127.0.0.1:{{port}}/secondpage.html">second page</a>.
+    Recurse to a <a href="http://localhost:{{port}}/secondpage.html">second page</a>.
   </p>
 </body>
 </html>
@@ -28,8 +27,8 @@ secondpage = """
 </head>
 <body>
   <p>
-    Recurse to a <a href="http://127.0.0.1:{{port}}/thirdpage.html">third page</a>.
-    Try the blacklisted <a href="http://127.0.0.1:{{port}}/index.html">main page</a>.
+    Recurse to a <a href="http://localhost:{{port}}/thirdpage.html">third page</a>.
+    Try the blacklisted <a href="http://localhost:{{port}}/index.html">main page</a>.
   </p>
 </body>
 </html>
@@ -42,7 +41,7 @@ thirdpage = """
 </head>
 <body>
   <p>
-    Try a hidden <a href="http://127.0.0.1:{{port}}/dummy.txt">dummy file</a>.
+    Try a hidden <a href="http://localhost:{{port}}/dummy.txt">dummy file</a>.
     Try to leave to <a href="http://no.such.domain/">another domain</a>.
   </p>
 </body>
@@ -55,10 +54,10 @@ Disallow: /dummy.txt
 """
 
 log = """\
-REASON	U_URL	U_SCHEME	U_HOST	U_PORT	U_PATH	U_PARAMS	U_QUERY	U_FRAGMENT	P_URL	P_SCHEME	P_HOST	P_PORT	P_PATH	P_PARAMS	P_QUERY	P_FRAGMENT
-BLACKLIST	http%3A//127.0.0.1%3A{{port}}/index.html	SCHEME_HTTP	127.0.0.1	{{port}}	index.html				http%3A//127.0.0.1%3A{{port}}/secondpage.html	SCHEME_HTTP	127.0.0.1	{{port}}	secondpage.html
-ROBOTS	http%3A//127.0.0.1%3A{{port}}/dummy.txt	SCHEME_HTTP	127.0.0.1	{{port}}	dummy.txt				http%3A//127.0.0.1%3A{{port}}/thirdpage.html	SCHEME_HTTP	127.0.0.1	{{port}}	thirdpage.html
-SPANNEDHOST	http%3A//no.such.domain/	SCHEME_HTTP	no.such.domain	80					http%3A//127.0.0.1%3A{{port}}/thirdpage.html	SCHEME_HTTP	127.0.0.1	{{port}}	thirdpage.html
+REASON\tU_URL\tU_SCHEME\tU_HOST\tU_PORT\tU_PATH\tU_PARAMS\tU_QUERY\tU_FRAGMENT\tP_URL\tP_SCHEME\tP_HOST\tP_PORT\tP_PATH\tP_PARAMS\tP_QUERY\tP_FRAGMENT
+BLACKLIST\thttp%3A//localhost%3A{{port}}/index.html\tSCHEME_HTTP\tlocalhost\t{{port}}\tindex.html\t\t\t\thttp%3A//localhost%3A{{port}}/secondpage.html\tSCHEME_HTTP\tlocalhost\t{{port}}\tsecondpage.html\t\t\t
+ROBOTS\thttp%3A//localhost%3A{{port}}/dummy.txt\tSCHEME_HTTP\tlocalhost\t{{port}}\tdummy.txt\t\t\t\thttp%3A//localhost%3A{{port}}/thirdpage.html\tSCHEME_HTTP\tlocalhost\t{{port}}\tthirdpage.html\t\t\t
+SPANNEDHOST\thttp%3A//no.such.domain/\tSCHEME_HTTP\tno.such.domain\t80\t\t\t\t\thttp%3A//localhost%3A{{port}}/thirdpage.html\tSCHEME_HTTP\tlocalhost\t{{port}}\tthirdpage.html\t\t\t
 """
 
 dummyfile = "Don't care."
@@ -93,7 +92,6 @@ post_test = {
 }
 
 err = HTTPTest (
-                name=TEST_NAME,
                 pre_hook=pre_test,
                 test_params=test_options,
                 post_hook=post_test

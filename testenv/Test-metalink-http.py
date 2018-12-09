@@ -2,20 +2,18 @@
 from sys import exit
 from test.http_test import HTTPTest
 from misc.wget_file import WgetFile
-import re
 import hashlib
 from base64 import b64encode
 
 """
     This is to test Metalink as HTTP file support in Wget.
 """
-TEST_NAME = "Metalink in HTTP"
 
 # Helper function for hostname, port and digest substitution
 def SubstituteServerInfo (text, host, port, digest):
-    text = re.sub (r'{{FILE1_HASH}}', digest, text)
-    text = re.sub (r'{{SRV_HOST}}', host, text)
-    text = re.sub (r'{{SRV_PORT}}', str (port), text)
+    text = text.replace('{{FILE1_HASH}}', digest)
+    text = text.replace('{{SRV_HOST}}', host)
+    text = text.replace('{{SRV_PORT}}', str (port))
     return text
 
 ############# File Definitions ###############################################
@@ -109,7 +107,6 @@ post_test = {
 }
 
 http_test = HTTPTest (
-                name=TEST_NAME,
                 pre_hook=pre_test,
                 test_params=test_options,
                 post_hook=post_test,
